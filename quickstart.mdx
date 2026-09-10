@@ -1,47 +1,207 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Quickstart: Your First kkRPC Remote Call in Minutes"
+sidebarTitle: "Quickstart"
+description: "Install kkRPC, wire up your first transport, and make a fully type-safe remote call in under five minutes — no code generation, no schema files required."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
-
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
-
-## Prerequisites
-
-Before you begin, you must have:
-
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
+kkRPC requires only TypeScript and the `kkrpc` npm package. You pick a transport — WebSocket, Worker, stdio, HTTP, and many others — import it from the matching subpath, and call remote methods as if they were local async functions. This guide walks through installation and two complete working examples: a WebSocket server/client pair and a Web Worker pair.
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
 
-    ```bash
-    npm install your-package
-    ```
-  </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+<Step title="Install the package">
 
-    ```bash
-    your-cli init
-    ```
-  </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+kkRPC has no mandatory runtime dependencies. Optional peer dependencies (`ws`, `hono`, `elysia`, etc.) are only needed for the specific transport you use.
 
+<Tabs>
+  <Tab title="npm">
     ```bash
-    your-cli start
+    npm install kkrpc
     ```
-  </Step>
+  </Tab>
+  <Tab title="pnpm">
+    ```bash
+    pnpm add kkrpc
+    ```
+  </Tab>
+  <Tab title="Bun">
+    ```bash
+    bun add kkrpc
+    ```
+  </Tab>
+  <Tab title="Deno / JSR">
+    ```bash
+    deno add jsr:@kunkun/kkrpc
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+  Install optional peer dependencies only for the transports you use. For the WebSocket example below, add `ws` as well: `npm install ws`.
+</Note>
+
+</Step>
+
+<Step title="Define and export your API type">
+
+Write your API as a plain object. Export its `typeof` as the shared type that both sides import — no separate schema or interface file needed.
+
+```typescript server.ts
+import { expose } from "kkrpc"
+import { webSocketTransport } from "kkrpc/ws"
+import { WebSocketServer } from "ws"
+
+const api = {
+  math: {
+    add(a: number, b: number) {
+      return a + b
+    }
+  },
+  async greet(name: string) {
+    return `Hello, ${name}`
+  }
+}
+
+export type API = typeof api
+
+const wss = new WebSocketServer({ port: 3000 })
+
+wss.on("connection", (socket) => {
+  expose(api, webSocketTransport(socket))
+})
+```
+
+The `expose()` function registers your API object on the given transport. Each incoming WebSocket connection gets its own channel instance.
+
+</Step>
+
+<Step title="Connect the client">
+
+On the client, import the exported `API` type and pass it to `wrap<API>()`. The returned proxy is fully typed — your editor will autocomplete method names and flag wrong argument types.
+
+```typescript client.ts
+import { wrap } from "kkrpc"
+import { webSocketClientTransport } from "kkrpc/ws"
+import type { API } from "./server"
+
+const api = wrap<API>(webSocketClientTransport({ url: "ws://localhost:3000" }))
+
+console.log(await api.greet("World"))    // "Hello, World"
+console.log(await api.math.add(1, 2))   // 3
+```
+
+`webSocketClientTransport` opens the socket for you. Once the connection is ready, calls on the proxy are forwarded automatically.
+
+</Step>
+
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+## Web Worker example
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
+Workers communicate through `postMessage`. kkRPC wraps this in the same `wrap`/`expose` pattern so you never write `postMessage` handlers by hand.
+
+<Steps>
+
+<Step title="Create the worker">
+
+Inside the worker file, expose your API with `workerSelfTransport()`. This transport hooks into the worker's own `onmessage` / `postMessage` globals.
+
+```typescript worker.ts
+import { expose } from "kkrpc"
+import { workerSelfTransport } from "kkrpc/worker"
+
+const api = {
+  async ping() {
+    return "pong"
+  },
+  async compute(x: number) {
+    return x * x
+  }
+}
+
+export type WorkerAPI = typeof api
+
+expose(api, workerSelfTransport())
+```
+
+</Step>
+
+<Step title="Call from the main thread">
+
+On the main thread, construct the `Worker` and wrap it with `workerTransport()`. Type the proxy with the exported `WorkerAPI`.
+
+```typescript main.ts
+import { wrap } from "kkrpc"
+import { workerTransport } from "kkrpc/worker"
+import type { WorkerAPI } from "./worker"
+
+const worker = new Worker(
+  new URL("./worker.ts", import.meta.url),
+  { type: "module" }
+)
+
+const api = wrap<WorkerAPI>(workerTransport(worker))
+
+console.log(await api.ping())        // "pong"
+console.log(await api.compute(7))   // 49
+```
+
+</Step>
+
+</Steps>
+
+## What `wrap` and `expose` do
+
+Both helpers are thin wrappers around `RPCChannel`. Understanding the relationship helps when you need more control.
+
+```typescript
+import { RPCChannel } from "kkrpc"
+
+// Equivalent to wrap<RemoteAPI>(transport)
+const channel = new RPCChannel<object, RemoteAPI>(transport)
+const api = channel.getAPI()
+
+// Equivalent to expose(localAPI, transport)
+const server = new RPCChannel<LocalAPI>(transport, { expose: localAPI })
+
+// Bidirectional: both sides expose and call
+const bidir = new RPCChannel<LocalAPI, RemoteAPI>(transport, { expose: localAPI })
+const remote = bidir.getAPI()
+bidir.destroy()   // unsubscribes, rejects pending calls, cleans up callbacks
+```
+
+<Tip>
+  Use `RPCChannel` directly when you need explicit channel ownership, bidirectional APIs on the same channel, or access to advanced options like `timeout`, `plugins`, `onClose`, and `getMetadata`.
 </Tip>
+
+## Disposing the channel
+
+When you are done, call `dispose()` on a proxy returned by `wrap()`, or `controller.dispose()` on the value returned by `expose()`.
+
+```typescript
+import { wrap, expose, dispose } from "kkrpc"
+
+// wrap() path
+const api = wrap<RemoteAPI>(transport)
+dispose(api)   // destroys the underlying channel
+
+// expose() path
+const controller = expose(localAPI, transport)
+controller.dispose()   // same effect
+```
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Core Concepts" icon="book" href="/concepts">
+    Understand transports, the RPCChannel lifecycle, the proxy model, and the plugin system.
+  </Card>
+  <Card title="Transports" icon="arrows-left-right" href="/transports">
+    See all available transports — HTTP, stdio, Electron, Tauri, message buses, and more.
+  </Card>
+  <Card title="Validation" icon="shield-check" href="/features/validation">
+    Add runtime input/output validation using Standard Schema compatible validators.
+  </Card>
+  <Card title="Middleware" icon="filter" href="/features/middleware">
+    Wrap handler execution with logging, auth, or other cross-cutting interceptors.
+  </Card>
+</CardGroup>

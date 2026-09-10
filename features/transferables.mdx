@@ -1,0 +1,141 @@
+---
+title: "Zero-Copy Transferable Objects in kkRPC"
+sidebarTitle: "Transferables"
+description: "Send ArrayBuffers and other transferables with zero-copy ownership transfer over Worker and other transfer-capable transports using the transfer() helper."
+---
+
+Transferable objects — primarily `ArrayBuffer` and typed array views — can be moved between threads or contexts without copying their underlying memory. kkRPC exposes a `transfer(value, transfers)` helper that marks an outbound value so the channel's transport layer picks it up and passes it to the platform's send operation (e.g. `postMessage`'s transfer list). This is most useful when passing large binary data to a Web Worker because it avoids an expensive memory copy on both sides.
+
+<Note>
+  Transfer support depends on the underlying transport. The channel reads `transport.capabilities?.transfer` before forwarding transferable lists. On transports that do not support transfer, the `transfer()` call is a no-op and the value is serialized normally — no code change is needed on the caller side.
+</Note>
+
+## Using transfer()
+
+Import `transfer` from `kkrpc` (or `kkrpc/browser` for browser-only builds). Wrap the value you want to transfer and pass the transferable items in the second argument. The same object appears in both arguments because the buffer itself is being transferred:
+
+```typescript main.ts
+import { wrap, transfer } from "kkrpc"
+import { workerTransport } from "kkrpc/worker"
+import type { WorkerAPI } from "./worker"
+
+const worker = new Worker(new URL("./worker.ts", import.meta.url), { type: "module" })
+const remote = wrap<WorkerAPI>(workerTransport(worker))
+
+// Allocate a 1 MiB buffer and transfer it zero-copy to the worker
+const buffer = new ArrayBuffer(1024 * 1024)
+const result = await remote.processBuffer(transfer(buffer, [buffer]))
+
+// buffer.byteLength is now 0 — ownership was transferred
+console.log(result.receivedLength) // 1048576
+```
+
+After a transfer, the original `ArrayBuffer` is detached (`byteLength === 0`). The worker now owns the memory.
+
+## Worker example
+
+```typescript worker.ts
+import { RPCChannel, transfer } from "kkrpc/browser"
+import { workerSelfTransport } from "kkrpc/worker"
+import type { MainAPI } from "./main"
+
+interface WorkerProcessResult {
+  receivedLength: number
+  checksum: number
+}
+
+interface WorkerProvidedBuffer {
+  buffer: ArrayBuffer
+  checksum: number
+}
+
+const workerAPI = {
+  async processBuffer(buffer: ArrayBuffer): Promise<WorkerProcessResult> {
+    const view = new Uint8Array(buffer)
+    let sum = 0
+    for (const byte of view) sum = (sum + byte) & 0xffff
+    return { receivedLength: buffer.byteLength, checksum: sum }
+  },
+
+  async provideBuffer(size: number): Promise<WorkerProvidedBuffer> {
+    const buffer = new ArrayBuffer(size)
+    const view = new Uint8Array(buffer)
+    crypto.getRandomValues(view)
+    let sum = 0
+    for (const byte of view) sum = (sum + byte) & 0xffff
+
+    // Transfer the buffer back to the main thread zero-copy
+    return { buffer: transfer(buffer, [buffer]), checksum: sum }
+  },
+}
+
+export type WorkerAPI = typeof workerAPI
+
+const rpc = new RPCChannel<typeof workerAPI, MainAPI>(workerSelfTransport(), {
+  expose: workerAPI,
+})
+```
+
+## Capability negotiation
+
+The channel checks `transport.capabilities?.transfer` at construction time. If the transport reports `transfer: true` and the channel option `enableTransfer` is not `false`, transferable lists are forwarded. Otherwise transfer markers are consumed silently and the value is sent normally:
+
+```typescript
+import { RPCChannel, transfer } from "kkrpc"
+
+// enableTransfer: false disables transfer even on a capable transport
+const channel = new RPCChannel(transport, { expose: api, enableTransfer: false })
+
+// On an HTTP transport (transfer: false), this is equivalent to passing buffer directly
+await remote.processBuffer(transfer(buffer, [buffer]))
+```
+
+The `TransferDescriptor` interface describes what `transfer()` produces internally:
+
+```typescript
+interface TransferDescriptor {
+  value: unknown        // The object to encode into the RPC message
+  transfers: Transferable[]  // Transferables to pass to the platform send call
+  handler?: string      // Reserved for custom platform transfer handling
+}
+```
+
+## Supported transferable types
+
+The Web platform supports the following types in a transfer list:
+
+- `ArrayBuffer`
+- `MessagePort`
+- `ReadableStream`, `WritableStream`, `TransformStream`
+- `ImageBitmap`
+- `OffscreenCanvas`
+
+<Warning>
+  `transfer()` requires an object as its first argument. Passing a primitive throws `"transfer() requires an object as the first argument"`. For typed arrays such as `Uint8Array`, pass the underlying `.buffer` in the transfer list: `transfer(view, [view.buffer])`.
+</Warning>
+
+## Fallback behavior
+
+If you call `transfer()` and the active transport does not support transferables, the `TransferDescriptor` marker is read and discarded. The value is sent to the remote side as a regular structured clone or JSON value. No error is thrown and your application logic does not need to branch on transport capability.
+
+```typescript
+import { wrap, transfer } from "kkrpc"
+import { webSocketClientTransport } from "kkrpc/ws"
+
+// WebSocket transports do not support structured-clone transfer;
+// the buffer is serialized to JSON instead — no code change needed.
+const remote = wrap<API>(webSocketClientTransport({ url: "ws://localhost:3000" }))
+const buffer = new ArrayBuffer(64)
+await remote.upload(transfer(buffer, [buffer]))
+```
+
+## Transport transfer support
+
+| Transport | Transfer support |
+|-----------|----------------|
+| Web Worker (`kkrpc/worker`) | Yes — `postMessage` with transfer list |
+| iframe (`kkrpc/iframe`) | Yes — `postMessage` with transfer list |
+| WebSocket (`kkrpc/ws`) | No |
+| stdio (`kkrpc/stdio`) | No |
+| HTTP (`kkrpc/http`) | No |
+| Electron IPC (`kkrpc/electron`) | Depends on IPC variant |

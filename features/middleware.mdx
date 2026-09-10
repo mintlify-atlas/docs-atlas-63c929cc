@@ -1,0 +1,227 @@
+---
+title: "Middleware Interceptors for RPC Handlers in kkRPC"
+sidebarTitle: "Middleware"
+description: "Wrap exposed RPC method handlers in an onion-style interceptor chain for logging, auth, rate limiting, argument mutation, and result transformation."
+---
+
+The `middlewarePlugin` from `kkrpc/middleware` wraps every incoming handler invocation in a chain of `MiddlewareHandler` functions. The model is the same onion-style pattern found in frameworks like Koa and Hono: each interceptor receives the call context and a `next` function that runs the rest of the chain. Code before `await next()` executes on the way in; code after executes on the way out. Returning without calling `next()` short-circuits the handler entirely. Middleware runs only on the **exposed** side — it does not wrap outgoing calls made through a remote proxy.
+
+<Note>
+  Calling the same `next()` more than once throws `"RPC interceptor next() called multiple times"` to prevent accidental duplicate handler execution.
+</Note>
+
+## Basic setup
+
+Pass an array of `MiddlewareHandler` functions to `middlewarePlugin` and include the result in the `plugins` array when calling `expose`:
+
+```typescript server.ts
+import { expose } from "kkrpc"
+import { middlewarePlugin, type MiddlewareHandler } from "kkrpc/middleware"
+import { webSocketTransport } from "kkrpc/ws"
+import { WebSocketServer } from "ws"
+
+const api = {
+  async add(a: number, b: number) { return a + b },
+  async secret() { return "classified" },
+}
+
+export type API = typeof api
+
+const logger: MiddlewareHandler = async (ctx, next) => {
+  console.log(`rpc:start ${ctx.method}`, ctx.args)
+  const result = await next()
+  console.log(`rpc:end   ${ctx.method}`)
+  return result
+}
+
+const wss = new WebSocketServer({ port: 3000 })
+wss.on("connection", (socket) => {
+  expose(api, webSocketTransport(socket), {
+    plugins: [middlewarePlugin([logger])],
+  })
+})
+```
+
+## Interceptor ordering (onion model)
+
+Interceptors execute in the order they are listed — the first entry is the **outermost** layer. Given `[logger, timing, auth]`, the execution order is:
+
+```
+logger before → timing before → auth before → handler
+                                auth after  → timing after → logger after
+```
+
+```typescript ordering.ts
+const events: string[] = []
+
+const outer: MiddlewareHandler = async (ctx, next) => {
+  events.push(`outer before ${ctx.method}`)
+  const result = await next()
+  events.push("outer after")
+  return result
+}
+
+const inner: MiddlewareHandler = async (_ctx, next) => {
+  events.push("inner before")
+  const result = await next()
+  events.push("inner after")
+  return result
+}
+
+// After one call to `add`:
+// ["outer before add", "inner before", "inner after", "outer after"]
+```
+
+## Common patterns
+
+<Tabs>
+  <Tab title="Logging">
+    Log method names, arguments, and execution time without touching the handler:
+
+    ```typescript server.ts
+    import { middlewarePlugin, type MiddlewareHandler } from "kkrpc/middleware"
+
+    const logger: MiddlewareHandler = async (ctx, next) => {
+      const argsStr = ctx.args
+        .map((a) => (typeof a === "object" ? JSON.stringify(a) : String(a)))
+        .join(", ")
+      console.log(`  [log]  ${ctx.method}(${argsStr})`)
+      return next()
+    }
+
+    const timing: MiddlewareHandler = async (ctx, next) => {
+      const start = performance.now()
+      const result = await next()
+      const elapsed = (performance.now() - start).toFixed(1)
+      console.log(`  [time] ${ctx.method} took ${elapsed}ms`)
+      return result
+    }
+
+    // Onion order: logger wraps timing wraps handler
+    expose(api, transport, {
+      plugins: [middlewarePlugin([logger, timing])],
+    })
+    ```
+  </Tab>
+  <Tab title="Authentication">
+    Block protected methods unless the session is authenticated. Throwing without calling `next()` short-circuits handler invocation:
+
+    ```typescript server.ts
+    import { middlewarePlugin, type MiddlewareHandler } from "kkrpc/middleware"
+
+    function createAuthInterceptor(session: {
+      authenticated: boolean
+    }): MiddlewareHandler {
+      const protectedMethods = new Set(["getSecretData", "deleteAccount"])
+
+      return async (ctx, next) => {
+        if (protectedMethods.has(ctx.method) && !session.authenticated) {
+          throw new Error(`Unauthorized: '${ctx.method}' requires authentication`)
+        }
+        return next()
+      }
+    }
+
+    wss.on("connection", (socket) => {
+      const session = { authenticated: false, username: "" }
+      expose(api, webSocketTransport(socket), {
+        plugins: [middlewarePlugin([createAuthInterceptor(session)])],
+      })
+    })
+    ```
+  </Tab>
+  <Tab title="Rate limiting">
+    Track call timestamps in a sliding window and reject excess calls before they reach the handler:
+
+    ```typescript server.ts
+    import { middlewarePlugin, type MiddlewareHandler } from "kkrpc/middleware"
+
+    function createRateLimiter(max: number, windowMs = 1000): MiddlewareHandler {
+      const calls: number[] = []
+      return async (_ctx, next) => {
+        const now = Date.now()
+        while (calls.length > 0 && calls[0]! <= now - windowMs) calls.shift()
+        if (calls.length >= max) {
+          throw new Error(`Rate limit exceeded: max ${max} calls per ${windowMs}ms`)
+        }
+        calls.push(now)
+        return next()
+      }
+    }
+
+    expose(api, transport, {
+      plugins: [middlewarePlugin([createRateLimiter(5)])],
+    })
+    ```
+  </Tab>
+</Tabs>
+
+## Mutating arguments and transforming results
+
+An interceptor can replace `ctx.args` before calling `next()` to change what the handler receives. It can also wrap or replace the return value from `next()`:
+
+```typescript transform.ts
+import { middlewarePlugin } from "kkrpc/middleware"
+
+expose(api, transport, {
+  plugins: [
+    middlewarePlugin([
+      async (ctx, next) => {
+        if (ctx.method === "add") {
+          ctx.args = [5, 6]         // override args before handler runs
+        }
+        const result = await next()
+        return Number(result) * 10  // transform result on the way out
+      },
+    ]),
+  ],
+})
+
+// Remote: await api.add(1, 2) → 110  (5+6=11, *10)
+```
+
+## Sharing state between interceptors
+
+Each call gets a fresh `ctx.state` object (`Record<string, unknown>`). Use it to pass data between interceptors in the same chain:
+
+```typescript state.ts
+import { middlewarePlugin } from "kkrpc/middleware"
+
+expose(api, transport, {
+  plugins: [
+    middlewarePlugin([
+      async (ctx, next) => {
+        ctx.state.multiplier = 4   // set in outer interceptor
+        return next()
+      },
+      async (ctx, next) => {
+        const result = await next()
+        return Number(result) * Number(ctx.state.multiplier) // read in inner
+      },
+    ]),
+  ],
+})
+// api.add(2, 3) → 5 * 4 = 20
+```
+
+## RPCCallContext fields
+
+<ResponseField name="id" type="string" required>
+  Compact request ID for correlating log lines to a single RPC call.
+</ResponseField>
+
+<ResponseField name="method" type="string" required>
+  Dot-joined method path, e.g. `"math.add"` or `"getSecretData"`.
+</ResponseField>
+
+<ResponseField name="args" type="unknown[]" required>
+  Mutable handler arguments. Assign a new array to replace what the handler receives.
+</ResponseField>
+
+<ResponseField name="meta" type="RPCMessageMetadata | undefined">
+  Optional protocol-level metadata sent by the caller (trace context, request ID, etc.).
+</ResponseField>
+
+<ResponseField name="state" type="Record<string, unknown>" required>
+  Per-call scratch space shared by all interceptors. Each call starts with an empty object.
+</ResponseField>

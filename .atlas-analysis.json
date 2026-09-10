@@ -1,0 +1,142 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "kkRPC",
+  "projectDescription": "A TypeScript-first RPC library for bidirectional, type-safe communication across workers, iframes, stdio, WebSocket, HTTP, desktop runtimes, and message buses.",
+  "theme": "luma",
+  "primaryColor": "#3d50f5",
+  "lightColor": "#040404",
+  "darkColor": null,
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "concepts"
+            ]
+          },
+          {
+            "group": "Transports",
+            "pages": [
+              "transports/worker",
+              "transports/websocket",
+              "transports/http",
+              "transports/stdio",
+              "transports/iframe",
+              "transports/desktop",
+              "transports/message-buses"
+            ]
+          },
+          {
+            "group": "Features",
+            "pages": [
+              "features/validation",
+              "features/middleware",
+              "features/streaming",
+              "features/callbacks",
+              "features/transferables",
+              "features/superjson"
+            ]
+          },
+          {
+            "group": "Advanced",
+            "pages": [
+              "advanced/plugins",
+              "advanced/inspector",
+              "advanced/relay",
+              "advanced/remote-refs",
+              "advanced/custom-transport"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/cross-language",
+              "guides/migration-1-0"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Core API",
+            "pages": [
+              "api/core",
+              "api/rpc-channel",
+              "api/transport"
+            ]
+          },
+          {
+            "group": "Transport Factories",
+            "pages": [
+              "api/transports-reference",
+              "api/plugins-reference"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Type-safe bidirectional RPC with proxy-based API calls",
+    "15+ built-in transports: Web Workers, iframe, stdio, WebSocket, HTTP, Electron, Tauri, Chrome extensions",
+    "Message bus transports: RabbitMQ, Kafka, Redis Streams, NATS",
+    "Plugin system for validation, middleware, and inspection",
+    "Async iterable streaming with windowed backpressure",
+    "Callback arguments by reference on evented transports",
+    "Transferable object support for zero-copy Workers",
+    "Standard Schema compatible runtime validation (Zod, Valibot, ArkType)",
+    "Cross-language interop via JSON protocol (Python, Go, Rust)",
+    "Tree-shakeable subpath exports for minimal browser bundles",
+    "SuperJSON codec for rich types (Date, Map, Set, BigInt)",
+    "Transport relay for bridge processes"
+  ],
+  "publicApiSurface": [
+    "wrap<RemoteAPI>(transport, options?) → RemoteAPI",
+    "expose(api, transport, options?) → ExposedController",
+    "dispose(api) → void",
+    "RPCChannel<LocalAPI, RemoteAPI>",
+    "RPCChannel.getAPI() → RemoteAPI",
+    "RPCChannel.destroy() → void",
+    "transfer(value, transfers?) → TransferDescriptor",
+    "withCallOptions(proxy, options) → proxy",
+    "releaseCallback(fn) → void",
+    "createTransport({ platform, codec, capabilities? }) → Transport",
+    "workerTransport(worker) — kkrpc/worker",
+    "workerSelfTransport() — kkrpc/worker",
+    "webSocketTransport(socket) — kkrpc/ws",
+    "webSocketClientTransport({ url }) — kkrpc/ws",
+    "httpClientTransport({ url }) — kkrpc/http",
+    "createHttpHandler(api) — kkrpc/http",
+    "nodeStdioTransport({ readable, writable }) — kkrpc/stdio",
+    "stdioJsonTransport({ readable, writable }) — kkrpc/stdio",
+    "iframeTransport(iframe, origin?) — kkrpc/iframe",
+    "iframeSelfTransport(origin?) — kkrpc/iframe",
+    "chromeExtensionTransport(port) — kkrpc/chrome-extension",
+    "electronIpcTransport() — kkrpc/electron",
+    "tauriTransport() — kkrpc/tauri",
+    "honoWebSocketTransport(ws) — kkrpc/ws/hono",
+    "elysiaWebSocketTransport(ws) — kkrpc/ws/elysia",
+    "socketIoTransport(socket) — kkrpc/socketio",
+    "kafkaTransport(options) — kkrpc/kafka",
+    "rabbitMqTransport(options) — kkrpc/rabbitmq",
+    "redisStreamsTransport(options) — kkrpc/redis-streams",
+    "natsTransport(options) — kkrpc/nats",
+    "validationPlugin(validators) — kkrpc/validation",
+    "defineAPI(api) — kkrpc/validation",
+    "defineMethod(validators, fn) — kkrpc/validation",
+    "extractValidators(api) — kkrpc/validation",
+    "middlewarePlugin(interceptors) — kkrpc/middleware",
+    "superJsonCodec() — kkrpc/superjson",
+    "createInspector(config?) — kkrpc/inspector",
+    "MemoryBackend — kkrpc/inspector",
+    "consoleBackend() — kkrpc/inspector",
+    "relayTransport(a, b) — kkrpc/relay"
+  ]
+}

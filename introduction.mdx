@@ -1,0 +1,121 @@
+---
+title: "kkRPC — Type-Safe Bidirectional RPC for Every Runtime"
+sidebarTitle: "Introduction"
+description: "TypeScript-first RPC with zero code generation, 15+ transports, and a tree-shakeable browser-safe core for workers, iframes, stdio, WebSocket, and Kafka."
+---
+
+kkRPC lets two endpoints call each other through type-safe proxy objects. You expose an API on one side, wrap a transport on the other side, and call remote functions, nested methods, properties, constructors, and callback arguments exactly like local code — no code generation, no schema files, and no separate protocol layer to maintain.
+
+The library is published as [`kkrpc`](https://www.npmjs.com/package/kkrpc) on npm and as [`@kunkun/kkrpc`](https://jsr.io/@kunkun/kkrpc) on JSR. The core `kkrpc` entry is browser-safe and deliberately small. Runtime transports and optional features live behind subpath exports so bundlers can tree-shake everything you do not use.
+
+## Why kkRPC?
+
+Most RPC libraries are built around one transport: tRPC is HTTP-first, Comlink is Worker-first. kkRPC starts from the premise that the transport should be swappable. The same `wrap`/`expose` API works whether your message travels through a WebSocket, a Web Worker, a child process's stdio, an Electron IPC pipe, a Tauri event, or a Kafka topic — you choose the transport, and the channel handles the rest.
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Install kkRPC and build your first end-to-end type-safe RPC in minutes.
+  </Card>
+  <Card title="Transports" icon="arrows-left-right" href="/transports">
+    Browse all 15+ supported transports and learn how to pick the right one.
+  </Card>
+</CardGroup>
+
+## Feature comparison
+
+The table below shows how kkRPC compares to the two libraries developers most often consider alongside it.
+
+| Feature | kkRPC | tRPC | Comlink |
+|---|---|---|---|
+| Type-safe remote calls | ✅ Yes | ✅ Yes | ✅ Yes |
+| Bidirectional APIs | ✅ Yes | ❌ No | ✅ Yes |
+| Browser-safe core entry | ✅ Yes | Mostly HTTP app focused | Browser focused |
+| Node.js, Deno, Bun stdio | ✅ Yes | ❌ No | ❌ No |
+| WebSocket and HTTP | ✅ Yes | HTTP focused | ❌ No |
+| Workers and iframes | ✅ Yes | ❌ No | ✅ Yes |
+| Electron, Tauri, Chrome extension | ✅ Yes | ❌ No | ❌ No |
+| Message buses | RabbitMQ, Kafka, Redis Streams, NATS | ❌ No | ❌ No |
+| Callback arguments | Evented transports | ❌ No | ✅ Yes |
+| Optional runtime validation | Standard Schema | Zod-oriented | ❌ No |
+| Middleware / interceptors | ✅ Yes | ✅ Yes | ❌ No |
+| Transferable objects | Where supported | ❌ No | ✅ Yes |
+| Code generation required | ❌ No | ❌ No | ❌ No |
+
+<Note>
+  Choose kkRPC when the hard part is not just an HTTP API. It is designed for cross-runtime systems: browser to worker, renderer to main process, app to plugin host, web server to child process, or one service connected to another through a message bus.
+</Note>
+
+## Supported runtimes and transports
+
+kkRPC ships a transport for every major runtime boundary. Each transport lives behind a subpath export so you only pay for what you import.
+
+<CardGroup cols={2}>
+  <Card title="Web Worker" icon="microchip">
+    `kkrpc/worker` — main-thread and worker-global helpers for `postMessage`-based communication.
+  </Card>
+  <Card title="WebSocket" icon="plug">
+    `kkrpc/ws` — bidirectional socket transport, plus Hono and Elysia framework adapters.
+  </Card>
+  <Card title="HTTP" icon="globe">
+    `kkrpc/http` — unary request/response handler and client, compatible with any HTTP runtime.
+  </Card>
+  <Card title="stdio" icon="terminal">
+    `kkrpc/stdio` — Node.js, Deno, and Bun process pipe transports for subprocess plugin hosts.
+  </Card>
+  <Card title="iframe" icon="window">
+    `kkrpc/iframe` — parent/child `postMessage` transport for cross-origin iframe communication.
+  </Card>
+  <Card title="Electron" icon="desktop">
+    `kkrpc/electron` — IPC endpoint and utility process transports for Electron apps.
+  </Card>
+  <Card title="Tauri" icon="shield">
+    `kkrpc/tauri` — Tauri event and shell process transports for desktop apps.
+  </Card>
+  <Card title="Chrome extension" icon="puzzle-piece">
+    `kkrpc/chrome-extension` — `chrome.runtime.Port` transport for extension messaging.
+  </Card>
+  <Card title="Socket.IO" icon="circle-nodes">
+    `kkrpc/socketio` — Socket.IO-backed event transport.
+  </Card>
+  <Card title="RabbitMQ" icon="rabbit">
+    `kkrpc/rabbitmq` — AMQP transport via `amqplib`.
+  </Card>
+  <Card title="Kafka" icon="layer-group">
+    `kkrpc/kafka` — Kafka topic transport via `kafkajs`.
+  </Card>
+  <Card title="Redis Streams" icon="database">
+    `kkrpc/redis-streams` — Redis stream transport via `ioredis`.
+  </Card>
+</CardGroup>
+
+## Core API at a glance
+
+kkRPC's public surface is intentionally small. The three functions below cover the vast majority of use cases.
+
+```typescript
+import { expose, wrap, RPCChannel } from "kkrpc"
+
+// One-way client — call a remote API
+const remote = wrap<RemoteAPI>(transport)
+await remote.math.add(1, 2)
+
+// One-way server — expose a local API
+const controller = expose(localAPI, transport)
+controller.dispose()
+
+// Bidirectional — both sides expose and call
+const channel = new RPCChannel<LocalAPI, RemoteAPI>(transport, { expose: localAPI })
+const api = channel.getAPI()
+await api.ping()
+channel.destroy()
+```
+
+## Package links
+
+| Platform | Package | Link |
+|---|---|---|
+| npm | `kkrpc` | [npmjs.com/package/kkrpc](https://www.npmjs.com/package/kkrpc) |
+| JSR | `@kunkun/kkrpc` | [jsr.io/@kunkun/kkrpc](https://jsr.io/@kunkun/kkrpc) |
+| API reference | Typedoc | [kunkunsh.github.io/kkrpc](https://kunkunsh.github.io/kkrpc/) |
+| Source | GitHub | [github.com/kunkunsh/kkrpc](https://github.com/kunkunsh/kkrpc) |
+| Examples | Source examples | [github.com/kunkunsh/kkrpc/tree/main/examples](https://github.com/kunkunsh/kkrpc/tree/main/examples) |

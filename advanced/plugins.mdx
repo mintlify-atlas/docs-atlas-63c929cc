@@ -1,0 +1,314 @@
+---
+title: "Plugin System: Hooks, Context, and Ordering in kkRPC"
+sidebarTitle: "Plugins"
+description: "Extend kkRPC server-side request handling with onRequest, wrapHandler, onResponse, and onError hooks. Compose multiple plugins including the built-in validation and middleware plugins."
+---
+
+The plugin system is how kkRPC lets you intercept and extend local request handling without touching your API implementation. Plugins are plain objects that implement any subset of four hooks, each receiving a strongly-typed context object that carries the request state. Because all four hooks share a mutable `state` bag, separate plugins can coordinate within the same request lifecycle without coupling their implementations.
+
+## The `RPCPlugin` Interface
+
+Every plugin is an object conforming to `RPCPlugin`. All four hooks are optional — implement only the ones you need.
+
+```typescript plugins.ts
+import type { RPCPlugin } from "kkrpc/plugins"
+
+const myPlugin: RPCPlugin = {
+  name: "my-plugin", // optional, shown in diagnostics
+
+  async onRequest(ctx) {
+    // runs before the local handler, in registration order
+  },
+
+  async wrapHandler(ctx, next) {
+    // wraps local handler execution, onion-style
+    const result = await next()
+    return result
+  },
+
+  async onResponse(ctx) {
+    // runs after the handler succeeds, in registration order
+  },
+
+  async onError(ctx) {
+    // runs when the handler or an earlier plugin throws
+  }
+}
+```
+
+<Note>
+  Plugins only observe **incoming** requests handled locally. They do not run when this channel's client proxy makes outgoing calls to a remote endpoint.
+</Note>
+
+## Hook Execution Order
+
+The four hooks fire in this sequence for every handled request:
+
+<Steps>
+  <Step title="onRequest">
+    All plugins run their `onRequest` hook in registration order. Use this hook to authenticate the caller, attach trace metadata to `ctx.state`, log the incoming call, or throw early to reject the request.
+  </Step>
+  <Step title="wrapHandler">
+    Plugins that implement `wrapHandler` form an onion chain around the actual local handler invocation. The first registered plugin wraps the outermost layer; calling `next()` descends through subsequent plugins until the handler itself is reached. You can mutate `ctx.args` before calling `next()`, or replace the return value by not calling `next()` at all.
+  </Step>
+  <Step title="onResponse">
+    After the handler returns, all plugins run `onResponse` in registration order. The `ctx.result` field is mutable — you can transform or sanitize the value before it is serialized and sent back.
+  </Step>
+  <Step title="onError">
+    If the handler or any earlier hook throws, all plugins run `onError` in registration order. You can replace `ctx.error` with a different error, or swallow it by setting it to something expected.
+  </Step>
+</Steps>
+
+<Warning>
+  `wrapHandler` plugins that call `next()` more than once within a single invocation will trigger an error: `"RPC plugin next() called multiple times"`. This guard prevents duplicate handler execution.
+</Warning>
+
+## Context Types
+
+Each hook receives a context object typed to the available data at that point in the lifecycle. All contexts share a mutable `state: Record<string, unknown>` property that persists across all hooks for the same request.
+
+<Tabs>
+  <Tab title="RPCRequestContext">
+    Available in `onRequest` and implicitly in `wrapHandler` (as `RPCHandlerContext` which extends it).
+
+    ```typescript
+    interface RPCRequestContext {
+      id: string                   // request identifier
+      operation: RPCOperation      // "call" | "get" | "set" | "new"
+      path: string[]               // property path segments
+      method: string               // dot-joined path, e.g. "math.add"
+      args: unknown[]              // decoded call arguments
+      value?: unknown              // decoded setter value, for "set" ops
+      meta?: RPCMessageMetadata    // protocol-level metadata
+      state: Record<string, unknown> // per-request shared state
+    }
+    ```
+  </Tab>
+  <Tab title="RPCHandlerContext">
+    Available in `wrapHandler`, extends `RPCRequestContext` with a reference to the exposed local API.
+
+    ```typescript
+    interface RPCHandlerContext extends RPCRequestContext {
+      localAPI: object  // the API object passed to expose()
+    }
+    ```
+  </Tab>
+  <Tab title="RPCResponseContext">
+    Available in `onResponse` after the handler returns successfully.
+
+    ```typescript
+    interface RPCResponseContext {
+      id: string
+      operation: RPCOperation
+      path: string[]
+      method: string
+      result: unknown              // mutable — modify to transform the response
+      meta?: RPCMessageMetadata
+      state: Record<string, unknown>
+    }
+    ```
+  </Tab>
+  <Tab title="RPCErrorContext">
+    Available in `onError` when any hook or the handler throws.
+
+    ```typescript
+    interface RPCErrorContext {
+      id: string
+      operation: RPCOperation
+      path: string[]
+      method: string
+      error: unknown               // mutable — modify to replace the error
+      meta?: RPCMessageMetadata
+      state: Record<string, unknown>
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Writing a Custom Plugin
+
+Here is a complete plugin that measures request latency using the shared `state` bag.
+
+```typescript latency-plugin.ts
+import type { RPCPlugin } from "kkrpc/plugins"
+
+export const latencyPlugin: RPCPlugin = {
+  name: "latency",
+
+  onRequest(ctx) {
+    ctx.state.startTime = Date.now()
+  },
+
+  onResponse(ctx) {
+    const ms = Date.now() - (ctx.state.startTime as number)
+    console.log(`[kkrpc] ${ctx.method} completed in ${ms}ms`)
+  },
+
+  onError(ctx) {
+    const ms = Date.now() - (ctx.state.startTime as number)
+    console.error(`[kkrpc] ${ctx.method} failed in ${ms}ms`, ctx.error)
+  }
+}
+```
+
+An authorization plugin that short-circuits execution before the handler runs:
+
+```typescript auth-plugin.ts
+import type { RPCPlugin } from "kkrpc/plugins"
+
+const PROTECTED_METHODS = new Set(["admin.deleteUser", "admin.resetData"])
+
+export const authPlugin: RPCPlugin = {
+  name: "auth",
+
+  onRequest(ctx) {
+    if (PROTECTED_METHODS.has(ctx.method)) {
+      const token = ctx.meta?.token as string | undefined
+      if (!isValidToken(token)) {
+        throw new Error(`Unauthorized: ${ctx.method}`)
+      }
+    }
+  }
+}
+
+function isValidToken(token: string | undefined): boolean {
+  return token === process.env.ADMIN_SECRET
+}
+```
+
+## Attaching Plugins to a Channel
+
+Pass an array of plugin objects to the `plugins` option of `expose()` or `RPCChannel`.
+
+<Tabs>
+  <Tab title="expose()">
+    ```typescript server.ts
+    import { expose } from "kkrpc"
+    import { latencyPlugin } from "./latency-plugin"
+    import { authPlugin } from "./auth-plugin"
+
+    const api = {
+      math: {
+        add: async (a: number, b: number) => a + b
+      },
+      admin: {
+        deleteUser: async (id: string) => { /* ... */ }
+      }
+    }
+
+    expose(api, transport, {
+      plugins: [authPlugin, latencyPlugin]
+    })
+    ```
+  </Tab>
+  <Tab title="RPCChannel">
+    ```typescript server.ts
+    import { RPCChannel } from "kkrpc"
+    import { latencyPlugin } from "./latency-plugin"
+
+    const channel = new RPCChannel(transport, {
+      expose: api,
+      plugins: [latencyPlugin]
+    })
+    ```
+  </Tab>
+</Tabs>
+
+Plugins run in the order they appear in the array. For `onRequest` and `onResponse`, registration order is linear (first to last). For `wrapHandler`, it is onion-style: the first plugin forms the outermost layer.
+
+## Built-in Plugins as Examples
+
+The validation and middleware features are both implemented as `RPCPlugin` objects, making them good reference implementations.
+
+<Accordion title="validationPlugin — uses onRequest and onResponse">
+  The validation plugin runs `onRequest` to validate arguments against Standard Schema-compatible schemas and `onResponse` to validate the return value. It mutates `ctx.args` with the schema-transformed values before calling the handler.
+
+  ```typescript
+  import { validationPlugin, type ValidatorMap } from "kkrpc/validation"
+  import { z } from "zod"
+
+  interface MathAPI {
+    add(a: number, b: number): Promise<number>
+  }
+
+  const validators: ValidatorMap<MathAPI> = {
+    add: {
+      input: z.tuple([z.number(), z.number()]),
+      output: z.number()
+    }
+  }
+
+  expose(api, transport, {
+    plugins: [validationPlugin<MathAPI>(validators)]
+  })
+  ```
+</Accordion>
+
+<Accordion title="middlewarePlugin — uses wrapHandler">
+  The middleware plugin translates a simpler `MiddlewareHandler` function signature into a `wrapHandler` hook. Each interceptor receives `ctx.args`, can mutate them before calling `next()`, and can transform the return value.
+
+  ```typescript
+  import { middlewarePlugin, type MiddlewareHandler } from "kkrpc/middleware"
+
+  const logger: MiddlewareHandler = async (ctx, next) => {
+    console.log("rpc:start", ctx.method, ctx.args)
+    const result = await next()
+    console.log("rpc:end", ctx.method)
+    return result
+  }
+
+  // Block a specific method
+  const guard: MiddlewareHandler = async (ctx, next) => {
+    if (ctx.method === "secret") throw new Error("blocked")
+    return next()
+  }
+
+  expose(api, transport, {
+    plugins: [middlewarePlugin([guard, logger])]
+  })
+  ```
+
+  Interceptors share the `ctx.state` bag and can pass values between them:
+
+  ```typescript
+  import { middlewarePlugin, type MiddlewareHandler } from "kkrpc/middleware"
+
+  const interceptors: MiddlewareHandler[] = [
+    async (ctx, next) => {
+      ctx.state.multiplier = 4
+      return await next()
+    },
+    async (ctx, next) => {
+      const result = await next()
+      return Number(result) * Number(ctx.state.multiplier)
+    }
+  ]
+
+  expose(api, transport, {
+    plugins: [middlewarePlugin(interceptors)]
+  })
+  ```
+</Accordion>
+
+## Plugin Ordering
+
+When multiple plugins are registered, the execution order follows these rules:
+
+| Hook | Order |
+|---|---|
+| `onRequest` | Linear, first to last |
+| `wrapHandler` | Onion — first plugin is outermost wrapper |
+| `onResponse` | Linear, first to last |
+| `onError` | Linear, first to last |
+
+For `wrapHandler`, consider two plugins `[A, B]`:
+
+```text
+A.wrapHandler begins
+  B.wrapHandler begins
+    local handler runs
+  B.wrapHandler ends
+A.wrapHandler ends
+```
+
+This means A can observe and transform the final result that B already processed.

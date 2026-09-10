@@ -1,0 +1,179 @@
+---
+title: "Async Iterable Streaming over RPC with kkRPC"
+sidebarTitle: "Streaming"
+description: "Stream async generator results across bidirectional transports using for-await with windowed pull backpressure, early cancellation, and iterable arguments."
+---
+
+kkRPC supports async iterable streaming through the `kkrpc/streaming` entry point, which exports a `StreamingRPCChannel` variant (also exported as `RPCChannel` from that entry). When a method returns an `AsyncIterable`, the channel encodes it as a stream reference on the wire. The consumer receives a live async iterable that it can drive with `for await`, and the producer only pushes chunks when the consumer has outstanding credit. Breaking out of a `for await` loop sends a `return()` signal to the source iterator so the generator is cleaned up promptly on the server side.
+
+<Warning>
+  HTTP is unary request/response and does not support async iterable streaming. Use a WebSocket, Worker, stdio, or any other bidirectional transport for methods that return or receive `AsyncIterable`.
+</Warning>
+
+## Setup
+
+Import `expose`, `wrap`, and `RPCChannel` from `kkrpc/streaming` instead of `kkrpc`. The rest of the API is identical:
+
+<CodeGroup>
+```typescript server.ts
+import { expose } from "kkrpc/streaming"
+import { webSocketTransport } from "kkrpc/ws"
+import { WebSocketServer } from "ws"
+
+interface TaskProgress {
+  percent: number
+  status: string
+}
+
+const api = {
+  // Async generator — yields values over time
+  async *streamTask(taskName: string): AsyncIterable<TaskProgress> {
+    const steps: TaskProgress[] = [
+      { percent: 0,   status: `${taskName}: Initializing` },
+      { percent: 25,  status: `${taskName}: Loading data` },
+      { percent: 50,  status: `${taskName}: Processing` },
+      { percent: 75,  status: `${taskName}: Writing output` },
+      { percent: 100, status: `${taskName}: Complete` },
+    ]
+    for (const step of steps) {
+      await new Promise((r) => setTimeout(r, 80))
+      yield step
+    }
+  },
+
+  // Normal async method still works alongside streaming methods
+  async ping() {
+    return "pong"
+  },
+}
+
+export type API = typeof api
+
+const wss = new WebSocketServer({ port: 3000 })
+wss.on("connection", (socket) => {
+  expose(api, webSocketTransport(socket))
+})
+```
+
+```typescript client.ts
+import { wrap } from "kkrpc/streaming"
+import { webSocketClientTransport } from "kkrpc/ws"
+import type { API } from "./server"
+
+const remote = wrap<API>(webSocketClientTransport({ url: "ws://localhost:3000" }))
+
+// Consume the stream with for await
+for await (const progress of remote.streamTask("data-migration")) {
+  console.log(`${progress.percent}% — ${progress.status}`)
+}
+```
+</CodeGroup>
+
+## Windowed pull backpressure
+
+The consumer sends `pull` credits to the producer in batches. By default the initial window is **32 credits** and new credits are sent after every **16 consumed values**. This keeps the pipe full without unbounded buffering — the producer only runs `iterator.next()` when the consumer has capacity. You do not need to configure this; the channel handles it automatically.
+
+## Breaking early (consumer cancellation)
+
+Breaking out of a `for await` loop or calling `.return()` on the iterator sends a `return` control message to the producer. The server-side `StreamingRPCChannel` calls `iterator.return()` on the source async generator, which executes any `finally` blocks in the generator body:
+
+```typescript client.ts
+import { wrap } from "kkrpc/streaming"
+import { webSocketClientTransport } from "kkrpc/ws"
+import type { API } from "./server"
+
+const remote = wrap<API>(webSocketClientTransport({ url: "ws://localhost:3000" }))
+
+// Only consume until the task is ready — then break
+for await (const line of remote.streamTask("deploy")) {
+  console.log(line.status)
+  if (line.status.includes("Complete")) break  // calls return() on server iterator
+}
+```
+
+## Passing async iterables as arguments
+
+Async iterables can also be passed **as arguments** to remote methods. The channel encodes the iterable as a stream reference before sending the request, and the server side reads it with `for await`:
+
+```typescript server.ts
+import { expose } from "kkrpc/streaming"
+import { webSocketTransport } from "kkrpc/ws"
+import { WebSocketServer } from "ws"
+
+const api = {
+  async processStream(items: AsyncIterable<number>): Promise<number> {
+    let total = 0
+    for await (const value of items) {
+      total += value
+    }
+    return total
+  },
+}
+
+export type API = typeof api
+
+const wss = new WebSocketServer({ port: 3000 })
+wss.on("connection", (socket) => expose(api, webSocketTransport(socket)))
+```
+
+```typescript client.ts
+import { wrap } from "kkrpc/streaming"
+import { webSocketClientTransport } from "kkrpc/ws"
+import type { API } from "./server"
+
+const remote = wrap<API>(webSocketClientTransport({ url: "ws://localhost:3000" }))
+
+async function* source() {
+  yield 1
+  yield 2
+  yield 3
+}
+
+const sum = await remote.processStream(source())
+console.log(sum) // 6
+```
+
+## Combining with middleware and validation
+
+`StreamingRPCChannel` supports the same `plugins` array as the base `RPCChannel`. Middleware and validation plugins work with streaming methods:
+
+```typescript server.ts
+import { expose } from "kkrpc/streaming"
+import { middlewarePlugin, type MiddlewareHandler } from "kkrpc/middleware"
+import { webSocketTransport } from "kkrpc/ws"
+import { WebSocketServer } from "ws"
+
+const logger: MiddlewareHandler = async (ctx, next) => {
+  console.log(`stream start: ${ctx.method}`)
+  const result = await next()
+  console.log(`stream dispatched: ${ctx.method}`)
+  return result
+}
+
+const wss = new WebSocketServer({ port: 3000 })
+wss.on("connection", (socket) => {
+  expose(api, webSocketTransport(socket), {
+    plugins: [middlewarePlugin([logger])],
+  })
+})
+```
+
+<Note>
+  The `logger` fires once when the call arrives and the first streaming response is dispatched — not once per yielded value. Middleware wraps the initial handler invocation, not each chunk delivery.
+</Note>
+
+## Transport compatibility
+
+| Transport | Streaming support |
+|-----------|-----------------|
+| WebSocket (`kkrpc/ws`) | Yes |
+| Web Worker (`kkrpc/worker`) | Yes |
+| stdio (`kkrpc/stdio`) | Yes |
+| iframe (`kkrpc/iframe`) | Yes |
+| Socket.IO (`kkrpc/socketio`) | Yes |
+| Electron IPC (`kkrpc/electron`) | Yes |
+| HTTP (`kkrpc/http`) | **No** — unary only |
+
+<Tip>
+  The default `kkrpc` entry exports a non-streaming `RPCChannel` to keep the browser bundle small. Always import from `kkrpc/streaming` when your API methods return or accept `AsyncIterable`.
+</Tip>

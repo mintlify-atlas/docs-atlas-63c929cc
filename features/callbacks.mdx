@@ -1,0 +1,158 @@
+---
+title: "Passing Callback Arguments to Remote RPC Methods in kkRPC"
+sidebarTitle: "Callbacks"
+description: "Pass local functions as arguments to remote methods over evented transports. The channel stores callbacks by reference and routes invocations back."
+---
+
+kkRPC allows you to pass plain JavaScript functions as arguments to remote methods. The channel keeps the function locally and sends a lightweight callback marker to the remote side. When the remote handler invokes the callback, a protocol message routes the call back through the channel to the original function. This makes patterns like progress listeners, event handlers, and subscription callbacks feel identical to local function passing — no special wrappers or setup required on the caller side.
+
+<Warning>
+  Callbacks require a **bidirectional, evented** transport. They are not supported over HTTP (`kkrpc/http`), which is unary request/response only.
+</Warning>
+
+## Basic usage
+
+Declare callback parameters in your API type as plain function types. The caller passes a real function; kkRPC encodes it as a callback marker automatically:
+
+```typescript server.ts
+import { expose } from "kkrpc"
+import { webSocketTransport } from "kkrpc/ws"
+import { WebSocketServer } from "ws"
+
+interface TaskProgress {
+  percent: number
+  status: string
+}
+
+const api = {
+  async processTaskWithProgress(
+    taskName: string,
+    onProgress: (progress: TaskProgress) => void
+  ): Promise<TaskProgress[]> {
+    const steps: TaskProgress[] = [
+      { percent: 0,   status: `${taskName}: Initializing` },
+      { percent: 50,  status: `${taskName}: Processing` },
+      { percent: 100, status: `${taskName}: Complete` },
+    ]
+    for (const step of steps) {
+      await new Promise((r) => setTimeout(r, 80))
+      onProgress(step)            // invokes the caller's local function
+    }
+    return steps
+  },
+}
+
+export type API = typeof api
+
+const wss = new WebSocketServer({ port: 3000 })
+wss.on("connection", (socket) => expose(api, webSocketTransport(socket)))
+```
+
+```typescript client.ts
+import { wrap } from "kkrpc"
+import { webSocketClientTransport } from "kkrpc/ws"
+import type { API } from "./server"
+
+const remote = wrap<API>(webSocketClientTransport({ url: "ws://localhost:3000" }))
+
+await remote.processTaskWithProgress("backup", (progress) => {
+  console.log(`Progress: ${progress.percent}% — ${progress.status}`)
+})
+```
+
+## How callback transmission works
+
+When the caller encodes a function argument, the channel:
+
+1. Assigns a stable ID to the function and registers it in an internal `callbacks` map.
+2. Sends a `{ __kkrpc_next_arg__: "callback", id }` envelope to the remote side instead of the function value.
+3. On the remote side, decodes the envelope into a **facade function** that, when called, sends a `cb` message back through the transport.
+4. The owner channel receives the `cb` message, looks up the function by ID, and invokes it locally with the decoded arguments.
+
+The same function passed in repeated calls reuses the same ID, so there is no per-call registration overhead.
+
+## Releasing callbacks with releaseCallback
+
+When the remote side no longer needs a callback, it should call `releaseCallback(fn)` on the facade it received. This sends a batched release message to the owner, which drops the registry entry. On runtimes that support `FinalizationRegistry`, facades that go out of scope are also collected automatically, but calling `releaseCallback` explicitly is recommended for prompt cleanup:
+
+```typescript server.ts
+import { expose } from "kkrpc"
+import { releaseCallback } from "kkrpc"
+import { webSocketTransport } from "kkrpc/ws"
+import { WebSocketServer } from "ws"
+
+const api = {
+  async registerOnce(callback: (value: string) => void): Promise<void> {
+    // Invoke once, then immediately release
+    callback("hello")
+    releaseCallback(callback)
+  },
+}
+
+const wss = new WebSocketServer({ port: 3000 })
+wss.on("connection", (socket) => expose(api, webSocketTransport(socket)))
+```
+
+`releaseCallback` returns `true` if the value was a managed facade and the release was sent, or `false` if the value is not a kkRPC callback facade (making it safe to call unconditionally). It is idempotent — calling it multiple times on the same facade is safe and sends only one release message.
+
+## Invoking a released callback
+
+After `releaseCallback(facade)` has been called, invoking the facade throws `RPCCallbackReleasedError`:
+
+```typescript
+import { RPCCallbackReleasedError, releaseCallback } from "kkrpc"
+
+function handleRelease(cb: (...args: unknown[]) => void) {
+  releaseCallback(cb)
+  try {
+    cb()  // throws RPCCallbackReleasedError
+  } catch (error) {
+    if (error instanceof RPCCallbackReleasedError) {
+      console.log("Callback was already released")
+    }
+  }
+}
+```
+
+## Callbacks and validation
+
+The validation plugin automatically filters callback arguments before input validation. If a method has the signature `(taskName: string, onProgress: (p: TaskProgress) => void)`, the input schema should only cover `z.tuple([z.string()])` — the callback is excluded from the validation pass and forwarded as-is:
+
+```typescript
+import { validationPlugin, type ValidatorMap } from "kkrpc/validation"
+import { z } from "zod"
+
+interface ProgressAPI {
+  processTask(
+    taskName: string,
+    onProgress: (progress: { percent: number }) => void
+  ): Promise<void>
+}
+
+const validators: ValidatorMap<ProgressAPI> = {
+  processTask: {
+    // Describe only the serializable arguments; callbacks are filtered automatically
+    input: z.tuple([z.string()]),
+  },
+}
+```
+
+## Limitations
+
+<Warning>
+  Callbacks are only supported on evented, bidirectional transports. HTTP (`kkrpc/http`) does not support callback arguments because there is no channel for the server to send messages back to the client. If you need progress reporting over HTTP, consider using a streaming WebSocket transport or polling instead.
+</Warning>
+
+| Transport | Callback support |
+|-----------|----------------|
+| WebSocket (`kkrpc/ws`) | Yes |
+| Web Worker (`kkrpc/worker`) | Yes |
+| stdio (`kkrpc/stdio`) | Yes |
+| iframe (`kkrpc/iframe`) | Yes |
+| Socket.IO (`kkrpc/socketio`) | Yes |
+| Electron IPC (`kkrpc/electron`) | Yes |
+| HTTP (`kkrpc/http`) | **No** |
+
+<Tip>
+  On runtimes without `FinalizationRegistry` (e.g. some older environments), the owner-side registry entry lives until either `releaseCallback` is called or the channel is destroyed. Always call `releaseCallback` when you know a callback will no longer be invoked.
+</Tip>

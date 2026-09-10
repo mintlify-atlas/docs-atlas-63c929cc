@@ -1,0 +1,312 @@
+---
+title: "Desktop App Transports: Electron, Tauri, Chrome Extension"
+sidebarTitle: "Desktop"
+description: "Add type-safe RPC to Electron IPC channels, Tauri shell child processes, and Chrome extension ports with dedicated kkrpc transport adapters."
+---
+
+kkrpc ships three transport adapters for desktop and browser extension runtimes. Each one maps the host platform's messaging primitive — Electron IPC, Tauri shell stdio, or Chrome extension `Port` — into the standard kkrpc `Transport<RPCMessage>` interface, so you get the same typed proxy API regardless of the underlying mechanism.
+
+All three transports are bidirectional and support callback arguments. None support transferable objects, because the underlying IPC channels serialize data by value.
+
+## Electron
+
+Import from `kkrpc/electron`. Three factories cover the three Electron contexts: an IPC channel transport for `ipcMain`/`ipcRenderer` pairs, a utility process transport for the parent side, and a utility process transport for the child side.
+
+### Install peer dependency
+
+```bash
+npm install electron
+```
+
+### API
+
+<ParamField path="electronIpcTransport" type="function">
+  Wraps any `ipcMain`/`ipcRenderer`-style endpoint (or a secure preload bridge) as a kkrpc transport. The `channel` option defaults to `"kkrpc:message"`.
+
+  ```typescript
+  import { electronIpcTransport } from "kkrpc/electron"
+  electronIpcTransport(options: ElectronTransportOptions): Transport<RPCMessage>
+  ```
+
+  **`ElectronTransportOptions`**
+  - `endpoint: ElectronMessageEndpoint` — `ipcMain`, `ipcRenderer`, or a `SecureIpcBridge`.
+  - `channel?: string` — IPC channel name (default `"kkrpc:message"`).
+</ParamField>
+
+<ParamField path="electronUtilityProcessTransport" type="function">
+  Parent-side transport for an Electron utility process. Closing the transport calls `endpoint.kill()` when available.
+
+  ```typescript
+  import { electronUtilityProcessTransport } from "kkrpc/electron"
+  electronUtilityProcessTransport(endpoint: ElectronUtilityProcessEndpoint): Transport<RPCMessage>
+  ```
+</ParamField>
+
+<ParamField path="electronUtilityProcessChildTransport" type="function">
+  Child-side transport for code running inside an Electron utility process. Reads `process.parentPort` by default.
+
+  ```typescript
+  import { electronUtilityProcessChildTransport } from "kkrpc/electron"
+  electronUtilityProcessChildTransport(endpoint?: ElectronUtilityProcessChildEndpoint): Transport<RPCMessage>
+  ```
+</ParamField>
+
+<ParamField path="createSecureIpcBridge" type="function">
+  Creates a channel-filtering preload bridge that only forwards channels in an explicit allow-list or matching a prefix. Pass the result as the `endpoint` to `electronIpcTransport`.
+
+  ```typescript
+  import { createSecureIpcBridge } from "kkrpc/electron"
+  createSecureIpcBridge(options: SecureIpcBridgeOptions): SecureIpcBridge
+  ```
+
+  **`SecureIpcBridgeOptions`**
+  - `ipcRenderer: ElectronMessageEndpoint` — the raw Electron renderer endpoint.
+  - `allowedChannels?: string[]` — explicit channel allow-list.
+  - `channelPrefix?: string` — channel prefix that is also allowed.
+</ParamField>
+
+### Main process / renderer example
+
+<CodeGroup>
+```typescript electron/main.ts
+import { app, BrowserWindow, ipcMain } from "electron"
+import { RPCChannel } from "kkrpc"
+import { electronIpcTransport } from "kkrpc/electron"
+import type { RendererAPI } from "./preload"
+
+const mainAPI = {
+  async getAppVersion(): Promise<string> {
+    return app.getVersion()
+  },
+  async showNotification(message: string): Promise<void> {
+    console.log("[Main] Notification:", message)
+  }
+}
+
+export type MainAPI = typeof mainAPI
+
+app.whenReady().then(() => {
+  const win = new BrowserWindow({
+    webPreferences: { preload: "preload.js", contextIsolation: true }
+  })
+
+  // One RPCChannel per window
+  const channel = new RPCChannel<MainAPI, RendererAPI>(
+    electronIpcTransport({ endpoint: ipcMain }),
+    { expose: mainAPI }
+  )
+
+  const renderer = channel.getAPI()
+
+  win.on("ready-to-show", async () => {
+    const info = await renderer.getRendererInfo()
+    console.log("Renderer info:", info)
+  })
+
+  win.loadFile("index.html")
+})
+```
+
+```typescript electron/preload.ts
+import { contextBridge, ipcRenderer } from "electron"
+import { createSecureIpcBridge } from "kkrpc/electron"
+
+// Only channels starting with "kkrpc-" are forwarded
+const bridge = createSecureIpcBridge({
+  ipcRenderer,
+  channelPrefix: "kkrpc-"
+})
+
+contextBridge.exposeInMainWorld("electron", {
+  ipcRenderer: bridge
+})
+```
+
+```typescript src/renderer.ts
+import { RPCChannel } from "kkrpc"
+import { electronIpcTransport } from "kkrpc/electron"
+import type { MainAPI } from "../electron/main"
+
+declare global {
+  interface Window {
+    electron: { ipcRenderer: import("kkrpc/electron").SecureIpcBridge }
+  }
+}
+
+const rendererAPI = {
+  async getRendererInfo(): Promise<{ platform: string; language: string }> {
+    return { platform: navigator.platform, language: navigator.language }
+  }
+}
+
+export type RendererAPI = typeof rendererAPI
+
+const channel = new RPCChannel<RendererAPI, MainAPI>(
+  electronIpcTransport({ endpoint: window.electron.ipcRenderer }),
+  { expose: rendererAPI }
+)
+
+const main = channel.getAPI()
+const version = await main.getAppVersion()
+console.log("App version:", version)
+```
+</CodeGroup>
+
+### Utility process example
+
+```typescript electron/main.ts
+import { utilityProcess } from "electron"
+import { RPCChannel } from "kkrpc"
+import { electronUtilityProcessTransport } from "kkrpc/electron"
+import type { WorkerAPI } from "./utility-worker"
+
+const child = utilityProcess.fork("utility-worker.js")
+
+const channel = new RPCChannel<{}, WorkerAPI>(
+  electronUtilityProcessTransport(child),
+  { expose: {} }
+)
+
+const worker = channel.getAPI()
+console.log(await worker.compute(42))
+```
+
+```typescript utility-worker.ts
+import { expose } from "kkrpc"
+import { electronUtilityProcessChildTransport } from "kkrpc/electron"
+
+const api = {
+  async compute(n: number): Promise<number> {
+    return n * n
+  }
+}
+
+export type WorkerAPI = typeof api
+
+expose(api, electronUtilityProcessChildTransport())
+```
+
+---
+
+## Tauri
+
+Import from `kkrpc/tauri`. The Tauri transport bridges a shell child process over newline-delimited JSON stdio, the same wire format as the [stdio transport](/transports/stdio).
+
+### Install peer dependency
+
+```bash
+npm install @tauri-apps/plugin-shell
+```
+
+### API
+
+<ParamField path="tauriShellStdioTransport" type="function">
+  Creates a transport over a Tauri shell child process. Reads frames from `options.stdout` and writes via `options.child.write()`.
+
+  ```typescript
+  import { tauriShellStdioTransport } from "kkrpc/tauri"
+  tauriShellStdioTransport(options: TauriShellStdioTransportOptions): Transport<RPCMessage>
+  ```
+
+  **`TauriShellStdioTransportOptions`**
+  - `stdout: TauriShellStdout` — the child's stdout stream.
+  - `child: TauriShellChild` — the child process handle for stdin writes.
+</ParamField>
+
+### Example
+
+```typescript src/App.ts
+import { wrap } from "kkrpc"
+import { tauriShellStdioTransport } from "kkrpc/tauri"
+import { Command } from "@tauri-apps/plugin-shell"
+
+// Spawn a sidecar binary that exposes an RPC API
+const command = Command.sidecar("binaries/my-plugin")
+const child = await command.spawn()
+
+const api = wrap<PluginAPI>(
+  tauriShellStdioTransport({
+    stdout: child.stdout,
+    child
+  })
+)
+
+const result = await api.process({ input: "hello" })
+console.log(result)
+```
+
+<Note>
+  The child binary must expose its API over its own stdin/stdout using `nodeStdioTransport` or an equivalent stdio transport from the child's runtime. See the [stdio transport guide](/transports/stdio) for child-side setup.
+</Note>
+
+---
+
+## Chrome Extension
+
+Import from `kkrpc/chrome-extension`. The extension transport wraps a `chrome.runtime.Port`-like object, which Chrome uses for long-lived messaging between background service workers, content scripts, and popup pages.
+
+### API
+
+<ParamField path="chromePortTransport" type="function">
+  Wraps a `chrome.runtime.Port` (or any `ChromePortLike`) as a kkrpc transport. The transport is bidirectional and callback-capable. Closing calls `port.disconnect()` when available and removes all message listeners.
+
+  ```typescript
+  import { chromePortTransport } from "kkrpc/chrome-extension"
+  chromePortTransport(port: ChromePortLike): Transport<RPCMessage>
+  ```
+</ParamField>
+
+### Example
+
+<CodeGroup>
+```typescript src/background.ts
+import { RPCChannel } from "kkrpc"
+import { chromePortTransport } from "kkrpc/chrome-extension"
+import type { ContentAPI } from "./rpc"
+
+const backgroundAPI = {
+  async ping(source: string): Promise<string> {
+    return `background pong for ${source}`
+  }
+}
+
+export type BackgroundAPI = typeof backgroundAPI
+
+// Each content script gets its own port and channel
+chrome.runtime.onConnect.addListener((port) => {
+  new RPCChannel<BackgroundAPI, ContentAPI>(
+    chromePortTransport(port),
+    { expose: backgroundAPI }
+  )
+})
+```
+
+```typescript src/content.ts
+import { RPCChannel } from "kkrpc"
+import { chromePortTransport } from "kkrpc/chrome-extension"
+import type { BackgroundAPI } from "./background"
+
+const contentAPI = {
+  async getPageTitle(): Promise<string> {
+    return document.title
+  }
+}
+
+export type ContentAPI = typeof contentAPI
+
+const port = chrome.runtime.connect({ name: "kkrpc" })
+
+const channel = new RPCChannel<ContentAPI, BackgroundAPI>(
+  chromePortTransport(port),
+  { expose: contentAPI }
+)
+
+const background = channel.getAPI()
+const response = await background.ping("content-script")
+console.log(response) // background pong for content-script
+```
+</CodeGroup>
+
+<Warning>
+  Chrome extension ports are disconnected when the extension service worker goes idle. Implement reconnection logic in your content script if you need persistent RPC after the service worker restarts.
+</Warning>

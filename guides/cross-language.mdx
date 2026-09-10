@@ -1,0 +1,523 @@
+---
+title: "Using kkRPC from Python, Go, and Rust"
+sidebarTitle: "Cross-Language"
+description: "Connect Python, Go, or Rust clients to a TypeScript kkRPC server over stdio or WebSocket using the compact JSON line-delimited wire protocol."
+---
+
+kkRPC's wire format is plain, line-delimited JSON — no binary framing, no custom serialisation format, and no code generation required. Any language that can read and write newline-terminated JSON strings over a pipe or WebSocket can participate in an RPC session. The `interop/` directory in the kkRPC repository ships ready-to-use client libraries for Python, Go, and Rust that implement exactly this protocol.
+
+## The JSON Wire Protocol
+
+Every message exchanged between a kkRPC endpoint and a cross-language peer is a compact JSON object followed by a newline character (`\n`). Over WebSocket the newline suffix is optional — the frame boundary serves the same purpose. Over stdio, each line is one complete message.
+
+The object always carries a `t` field that identifies the message type. The remaining fields depend on the type.
+
+### Message Types
+
+| `t` value | Direction         | Required fields           | Description                                                                          |
+| --------- | ----------------- | ------------------------- | ------------------------------------------------------------------------------------ |
+| `"q"`     | caller → callee   | `id`, `op`, `p`           | RPC request. `op` is `"call"`, `"get"`, `"set"`, or `"new"`. `a` holds the arguments array. |
+| `"r"`     | callee → caller   | `id`, then `v` **or** `e` | RPC response. Success carries `v` (return value). Errors carry `e: { n, m, s? }`.   |
+| `"cb"`    | either direction  | `id`, `a`                 | Callback invocation. Targets a callback previously registered by `id`.               |
+
+A minimal request–response pair for `math.add(1, 2)` looks like this:
+
+```json
+{"t":"q","id":"a1b2-c3d4","op":"call","p":["math","add"],"a":[1,2]}
+{"t":"r","id":"a1b2-c3d4","v":3}
+```
+
+The `p` field is always a string array representing the dot-path to the method or property. `a` is optional and omitted when there are no arguments.
+
+### Error Shape
+
+When the remote handler throws, the response carries an `e` object instead of `v`:
+
+```json
+{"t":"r","id":"a1b2-c3d4","e":{"n":"TypeError","m":"expected number","s":"TypeError: expected number\n  at ..."}}
+```
+
+`n` is the error name, `m` is the message, and `s` is the optional stack trace.
+
+### Callback Encoding
+
+Functions cannot be serialised as JSON values. When a caller wants to pass a callback, it replaces the function argument with a marker object and registers the callback locally under the given ID:
+
+```json
+{"__kkrpc_next_arg__": "callback", "id": "<callback-id>"}
+```
+
+The receiving side stores this ID. When it needs to invoke the callback it sends a `"cb"` message:
+
+```json
+{"t":"cb","id":"<callback-id>","a":["callback:hello"]}
+```
+
+The original caller looks up the registered function by ID and calls it with the decoded arguments. kkRPC may also wrap plain return values in a value envelope — non-JavaScript runtimes should unwrap this shape when they see it in a `"cb"` argument:
+
+```json
+{"__kkrpc_next_arg__": "value", "v": 42}
+```
+
+## Node Test Server
+
+The reference test server at `interop/node/server.ts` exposes four primitives over Node stdio using `nodeStdioTransport()`. Run it with Bun or `ts-node` to try any of the language clients shown below.
+
+```typescript interop/node/server.ts
+import { expose } from "kkrpc"
+import { nodeStdioTransport } from "kkrpc/stdio"
+
+const api = {
+  math: {
+    add(a: number, b: number) {
+      return a + b
+    }
+  },
+  echo<T>(value: T) {
+    return value
+  },
+  withCallback(value: string, cb: (payload: string) => void) {
+    cb(`callback:${value}`)
+    return "callback-sent"
+  },
+  counter: 42,
+  settings: {
+    theme: "light",
+    notifications: { enabled: true }
+  }
+}
+
+const controller = expose(api, nodeStdioTransport())
+
+process.on("SIGTERM", () => { controller.dispose(); process.exit(0) })
+process.on("SIGINT",  () => { controller.dispose(); process.exit(0) })
+```
+
+A companion WebSocket server (`interop/node/ws-server.ts`) exposes the same API on an ephemeral port using `webSocketTransport()` from `kkrpc/ws`.
+
+```typescript interop/node/ws-server.ts
+import { WebSocketServer } from "ws"
+import { expose } from "kkrpc"
+import { webSocketTransport } from "kkrpc/ws"
+
+const api = { /* same as server.ts */ }
+
+const wss = new WebSocketServer({ port: 8789 })
+wss.on("connection", (ws) => {
+  const controller = expose(api, webSocketTransport(ws))
+  ws.on("close", () => controller.dispose())
+})
+```
+
+## Language Clients
+
+<Tabs>
+  <Tab title="Python">
+
+### Installation
+
+The Python library is published to PyPI as `kkrpc-interop`. For local development, install from the repository:
+
+```bash
+pip install kkrpc-interop
+```
+
+```bash
+# Local development
+python -m venv .venv
+source .venv/bin/activate
+pip install -r interop/python/requirements.txt
+export PYTHONPATH="$PWD/interop/python:$PYTHONPATH"
+```
+
+<Note>
+  The Python library has **no third-party runtime dependencies** for stdio. The WebSocket transport uses a stdlib-only RFC 6455 client implementation.
+</Note>
+
+### `RpcClient` API
+
+`RpcClient` wraps any `Transport` and exposes four methods that mirror the four RPC operations:
+
+| Method | Operation | Description |
+| ------ | --------- | ----------- |
+| `call(method, *args)` | `"call"` | Call a remote method by dot-separated name |
+| `get(path)` | `"get"` | Read a remote property |
+| `set(path, value)` | `"set"` | Write a remote property |
+| `construct(method, *args)` | `"new"` | Invoke a remote constructor |
+
+`call()` blocks the calling thread until the response arrives. A background daemon thread reads incoming messages and dispatches responses and callbacks.
+
+### Stdio Client
+
+```python interop/python/stdio_client.py
+from kkrpc import RpcClient, StdioTransport
+
+# Spawn the Node server as a child process
+transport = StdioTransport.from_process(["bun", "interop/node/server.ts"])
+client = RpcClient(transport)
+
+# Call a nested method
+result = client.call("math.add", 1, 2)
+print(result)  # 3
+
+# Echo arbitrary data
+echoed = client.call("echo", {"hello": "kkrpc"})
+print(echoed)  # {'hello': 'kkrpc'}
+
+# Pass a callback argument
+def on_callback(payload):
+    print("callback received:", payload)
+
+ret = client.call("withCallback", "hello", on_callback)
+print(ret)  # "callback-sent"
+
+# Read a remote property
+theme = client.get(["settings", "theme"])
+print(theme)  # "light"
+
+client.close()
+```
+
+### WebSocket Client
+
+```python interop/python/ws_client.py
+from kkrpc import RpcClient, WebSocketTransport
+
+transport = WebSocketTransport("ws://localhost:8789")
+client = RpcClient(transport)
+
+result = client.call("math.add", 10, 32)
+print(result)  # 42
+
+echoed = client.call("echo", [1, 2, 3])
+print(echoed)  # [1, 2, 3]
+
+client.close()
+```
+
+### Python Server
+
+The interop library also ships `RpcServer` for exposing a Python API to a TypeScript caller:
+
+```python interop/python/server.py
+from kkrpc import RpcServer, StdioTransport
+
+api = {
+    "math": {
+        "add": lambda a, b: a + b,
+    },
+    "echo": lambda value: value,
+}
+
+# from_stdio() reads process stdin and writes to process stdout
+server = RpcServer(StdioTransport.from_stdio(), api)
+# The reader thread starts immediately; call server.close() to shut down.
+```
+
+### Running Python Tests
+
+```bash
+pytest interop/python/tests
+```
+
+  </Tab>
+  <Tab title="Go">
+
+### Installation
+
+The Go package is published as `kkrpc-interop`. From the repository:
+
+```bash
+go get kkrpc-interop
+```
+
+```bash
+# From repo
+cd interop/go
+go test ./...
+```
+
+### `Client` API
+
+`NewClient(transport)` returns a `*Client`. The transport must implement the `Transport` interface:
+
+```go interop/go/kkrpc/transport.go
+type Transport interface {
+    Read() (string, error)
+    Write(message string) error
+    Close() error
+}
+```
+
+`Client` exposes three methods:
+
+| Method | Description |
+| ------ | ----------- |
+| `Call(method string, args ...any) (any, error)` | Call a remote method by dot-separated name |
+| `Get(path []string) (any, error)` | Read a remote property |
+| `Set(path []string, value any) (any, error)` | Write a remote property |
+
+A background goroutine reads incoming messages and routes responses and callbacks to waiting callers through buffered channels.
+
+### Callback Type
+
+Pass a `kkrpc.Callback` value (`func(args ...any)`) as an argument to register it with the client before serialising the request:
+
+```go
+type Callback func(args ...any)
+```
+
+### Stdio Client
+
+```go interop/go/stdio_client.go
+package main
+
+import (
+	"fmt"
+	"os/exec"
+
+	"kkrpc-interop/kkrpc"
+)
+
+func main() {
+	// Spawn the Node server as a child process
+	cmd := exec.Command("bun", "interop/node/server.ts")
+	transport, err := kkrpc.NewStdioTransport(cmd)
+	if err != nil {
+		panic(err)
+	}
+	client := kkrpc.NewClient(transport)
+	defer client.Close()
+
+	// Call a nested method
+	result, _ := client.Call("math.add", 1, 2)
+	fmt.Println(result) // 3
+
+	// Echo arbitrary data
+	echoed, _ := client.Call("echo", map[string]any{"hello": "kkrpc"})
+	fmt.Println(echoed)
+
+	// Pass a callback argument
+	done := make(chan struct{})
+	cb := kkrpc.Callback(func(args ...any) {
+		fmt.Println("callback received:", args[0])
+		close(done)
+	})
+
+	ret, _ := client.Call("withCallback", "hello", cb)
+	fmt.Println(ret) // "callback-sent"
+	<-done
+
+	// Read a remote property
+	theme, _ := client.Get([]string{"settings", "theme"})
+	fmt.Println(theme) // "light"
+}
+```
+
+### WebSocket Client
+
+```go interop/go/ws_client.go
+package main
+
+import (
+	"fmt"
+
+	"kkrpc-interop/kkrpc"
+)
+
+func main() {
+	transport, err := kkrpc.NewWebSocketTransport("ws://localhost:8789")
+	if err != nil {
+		panic(err)
+	}
+	client := kkrpc.NewClient(transport)
+	defer client.Close()
+
+	result, _ := client.Call("math.add", 10, 32)
+	fmt.Println(result) // 42
+
+	echoed, _ := client.Call("echo", []any{1, 2, 3})
+	fmt.Println(echoed)
+}
+```
+
+### Go Server
+
+Expose a Go API to a TypeScript kkRPC caller. All registered handlers must use the variadic `func(...any) any` signature:
+
+```go interop/go/server.go
+package main
+
+import "kkrpc-interop/kkrpc"
+
+func main() {
+	api := map[string]any{
+		"math": map[string]any{
+			"add": func(args ...any) any {
+				return args[0].(float64) + args[1].(float64)
+			},
+		},
+		"echo": func(args ...any) any {
+			return args[0]
+		},
+	}
+
+	server := kkrpc.NewServer(kkrpc.NewStdioTransportFromStdIO(), api)
+	defer server.Close()
+	select {} // block forever
+}
+```
+
+<Warning>
+  The Go server requires the strict `func(...any) any` signature for all registered handlers. Typed signatures like `func(a, b int) int` will panic at runtime. Use type assertions inside the handler body to convert JSON-decoded `float64` values to concrete types.
+</Warning>
+
+### Running Go Tests
+
+```bash
+cd interop/go
+go test ./...
+```
+
+  </Tab>
+  <Tab title="Rust">
+
+### Installation
+
+The Rust crate is published as `kkrpc-interop`. Add it to your `Cargo.toml`:
+
+```toml Cargo.toml
+[dependencies]
+kkrpc-interop = "*"
+serde_json = "1"
+```
+
+```bash
+# From repo
+cd interop/rust
+cargo test
+```
+
+### `Client` API
+
+`Client::new(transport)` accepts any `Arc<dyn Transport>`. Arguments are passed as a `Vec<Arg>`, where `Arg` is:
+
+```rust
+pub enum Arg {
+    Value(serde_json::Value),  // a plain JSON value
+    Callback(Arc<dyn Fn(Vec<Arg>) + Send + Sync>),  // a local callback
+}
+```
+
+`client.call(method, args)` blocks until the response arrives and returns `Result<serde_json::Value, RpcError>`.
+
+### Stdio Client
+
+```rust interop/rust/src/stdio_client.rs
+use kkrpc::{Arg, Client, StdioTransport};
+use serde_json::json;
+use std::process::{Command, Stdio};
+use std::sync::Arc;
+
+fn main() {
+    // Spawn the Node server as a child process
+    let mut child = Command::new("bun")
+        .arg("interop/node/server.ts")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn bun server");
+
+    let stdout = child.stdout.take().expect("stdout");
+    let stdin  = child.stdin.take().expect("stdin");
+
+    let transport = StdioTransport::new(stdout, stdin);
+    let client = Client::new(Arc::new(transport));
+
+    // Call a nested method
+    let result = client
+        .call("math.add", vec![Arg::Value(json!(1)), Arg::Value(json!(2))])
+        .expect("call math.add");
+    println!("{result}"); // 3
+
+    // Echo arbitrary data
+    let echoed = client
+        .call("echo", vec![Arg::Value(json!({"hello": "kkrpc"}))])
+        .expect("call echo");
+    println!("{echoed}");
+}
+```
+
+### WebSocket Client
+
+```rust interop/rust/src/ws_client.rs
+use kkrpc::{Arg, Client, WebSocketTransport};
+use serde_json::json;
+
+fn main() {
+    let transport = WebSocketTransport::connect("ws://localhost:8789")
+        .expect("connect");
+    let client = Client::new(transport);
+
+    let result = client
+        .call("math.add", vec![Arg::Value(json!(10)), Arg::Value(json!(32))])
+        .expect("call math.add");
+    println!("{result}"); // 42
+}
+```
+
+### Rust Server
+
+```rust interop/rust/src/server.rs
+use kkrpc::{Arg, RpcApi, Server, StdioTransport};
+use serde_json::Value;
+use std::sync::Arc;
+
+fn main() {
+    let mut api = RpcApi::new();
+
+    api.register_method("math.add", Arc::new(|args: Vec<Arg>| {
+        let a = match &args[0] { Arg::Value(v) => v.as_i64().unwrap_or(0), _ => 0 };
+        let b = match &args[1] { Arg::Value(v) => v.as_i64().unwrap_or(0), _ => 0 };
+        Value::from(a + b)
+    }));
+
+    let transport = Arc::new(StdioTransport::new(
+        std::io::stdin(),
+        std::io::stdout(),
+    ));
+    let _server = Server::new(transport, api);
+
+    loop { std::thread::park(); }
+}
+```
+
+### Running Rust Tests
+
+```bash
+cd interop/rust
+cargo test
+```
+
+  </Tab>
+</Tabs>
+
+## Protocol Implementation Notes
+
+<Accordion title="Transport differences: stdio vs WebSocket">
+  Over **stdio**, messages are newline-delimited UTF-8 strings. Each message is one JSON object followed by exactly one `\n` byte. The receiver reads lines and parses each non-empty line as JSON. This makes stdio transports trivially compatible with any language that supports line-buffered I/O.
+
+  Over **WebSocket**, the same JSON object is sent as a single text frame. The newline suffix is optional because WebSocket frames are already delimited. All three language libraries handle both transports through a common `Transport` interface/trait so the RPC client code is identical regardless of which transport is used.
+</Accordion>
+
+<Accordion title="SuperJSON and codec selection">
+  The stable kkRPC JS side uses compact JSON `RPCMessage` records by default. If your TypeScript endpoint uses `superJsonCodec()` via `createTransport()`, the messages will start with `{"json": ...}` instead of the compact shape. Cross-language clients should target the default compact protocol and avoid the SuperJSON codec on the server unless all peers implement it.
+</Accordion>
+
+<Accordion title="Transfer slots and structured clone">
+  The interop layer intentionally omits `Transferable` support. Transfer descriptors (`transfer()`) and structured clone payloads are JavaScript-only concepts. Cross-language peers should use plain JSON-serialisable values for all arguments and return values.
+</Accordion>
+
+<Tip>
+  Start with the compact JSON protocol over **stdio**. It requires no network stack, is easy to debug by inspecting process pipes, and works identically in all three language clients. Switch to WebSocket only when you need to connect processes that are not in a parent–child relationship.
+</Tip>

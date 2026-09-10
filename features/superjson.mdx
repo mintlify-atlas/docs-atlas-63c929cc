@@ -1,0 +1,155 @@
+---
+title: "SuperJSON Codec for Rich Value Types in kkRPC"
+sidebarTitle: "SuperJSON"
+description: "Preserve Date, Map, Set, BigInt, and other non-JSON values across string-based transports by composing a SuperJSON codec with createTransport."
+---
+
+The core kkRPC protocol uses JSON-compatible wire values by default, which means `Date` objects become strings, `Map` and `Set` are lost, and `BigInt` throws a serialization error. The `superJsonCodec()` from `kkrpc/superjson` solves this by encoding each message with `superjson.stringify()` (which attaches a metadata sidecar for non-JSON types) and decoding with `superjson.parse()`. The codec is composable with any string-framed platform via `createTransport` from `kkrpc/transport`.
+
+<Warning>
+  The SuperJSON codec only works with transports created through `createTransport({ platform, codec })`. It cannot be applied to pre-built transports returned by helpers like `webSocketTransport()`, `workerTransport()`, or `workerSelfTransport()`. Those transports already handle serialization internally.
+</Warning>
+
+## When to use SuperJSON
+
+Use `superJsonCodec()` when:
+
+- Your RPC methods pass or return `Date`, `Map`, `Set`, `BigInt`, or typed arrays.
+- The underlying platform exchanges string frames (stdio, custom WebSocket framing, etc.).
+- You are composing a transport from scratch using a `Platform` primitive and need richer value support than plain JSON.
+
+If your transport uses structured-clone (Web Workers, Electron IPC) — where these types survive natively — you do not need a SuperJSON codec.
+
+## Installation
+
+SuperJSON is a peer dependency. Install it alongside `kkrpc`:
+
+```bash
+npm install kkrpc superjson
+```
+
+## Basic usage with createTransport
+
+Import `superJsonCodec` from `kkrpc/superjson` and pass it as the `codec` option to `createTransport`:
+
+```typescript transport.ts
+import { createTransport } from "kkrpc/transport"
+import { superJsonCodec } from "kkrpc/superjson"
+
+// platform comes from a stdio, WebSocket, or custom platform primitive
+const transport = createTransport({ platform, codec: superJsonCodec() })
+```
+
+Once composed, `wrap` and `expose` receive the transport as normal:
+
+```typescript server.ts
+import { expose } from "kkrpc"
+import { createTransport } from "kkrpc/transport"
+import { superJsonCodec } from "kkrpc/superjson"
+import { stdioPlatform } from "kkrpc/stdio"
+
+const api = {
+  async getStats(): Promise<{ at: Date; counts: Map<string, number> }> {
+    return {
+      at: new Date(),
+      counts: new Map([["requests", 1024n as unknown as number], ["errors", 3]]),
+    }
+  },
+
+  async addBigInts(a: bigint, b: bigint): Promise<bigint> {
+    return a + b
+  },
+}
+
+export type API = typeof api
+
+const transport = createTransport({
+  platform: stdioPlatform({ readable: process.stdin, writable: process.stdout }),
+  codec: superJsonCodec(),
+})
+
+expose(api, transport)
+```
+
+```typescript client.ts
+import { wrap } from "kkrpc"
+import { createTransport } from "kkrpc/transport"
+import { superJsonCodec } from "kkrpc/superjson"
+import { stdioPlatform } from "kkrpc/stdio"
+import { spawn } from "node:child_process"
+import type { API } from "./server"
+
+const child = spawn("node", ["server.js"])
+const transport = createTransport({
+  platform: stdioPlatform({ readable: child.stdout, writable: child.stdin }),
+  codec: superJsonCodec(),
+})
+
+const remote = wrap<API>(transport)
+
+const stats = await remote.getStats()
+console.log(stats.at instanceof Date)    // true
+console.log(stats.counts instanceof Map) // true
+
+const sum = await remote.addBigInts(1n, 2n)
+console.log(sum === 3n)                  // true
+```
+
+## Newline-framed variant
+
+For stream-based transports that need length framing, use `superJsonLineCodec()` instead. It appends `\n` to each encoded message and trims it before decoding:
+
+```typescript
+import { createTransport } from "kkrpc/transport"
+import { superJsonLineCodec } from "kkrpc/superjson"
+
+const transport = createTransport({
+  platform: streamPlatform,
+  codec: superJsonLineCodec(),
+})
+```
+
+## Round-trip example
+
+The following shows which value types survive the SuperJSON codec:
+
+```typescript roundtrip.ts
+import { superJsonCodec } from "kkrpc/superjson"
+
+const codec = superJsonCodec<unknown>()
+
+const input = {
+  date:   new Date("2026-06-07T00:00:00.000Z"),
+  map:    new Map([["a", 1]]),
+  set:    new Set(["x", "y"]),
+  bigint: 123n,
+}
+
+const wire = codec.encode(input)    // string with SuperJSON metadata
+const output = codec.decode(wire)   // reconstructed with original types
+
+console.log(output.date instanceof Date)    // true
+console.log(output.map instanceof Map)      // true
+console.log(output.set instanceof Set)      // true
+console.log(output.bigint === 123n)         // true
+```
+
+## Limitations
+
+<Warning>
+  Setting `capabilities.transfer` to `false` is a hard constraint of the SuperJSON codec. Even if the underlying platform supports transferables, the codec does not preserve transferable objects — all values are serialized into strings. Zero-copy `ArrayBuffer` transfer is not available when using SuperJSON.
+</Warning>
+
+<Info>
+  The export provides both `superJsonCodec` / `superJsonLineCodec` (camelCase) and lowercase aliases `superjsonCodec` / `superjsonLineCodec` for callers who prefer the npm package spelling. They are identical references.
+</Info>
+
+## API reference
+
+<Accordion title="superJsonCodec()">
+  Returns a `Codec<TMessage, string>` that serializes with `superjson.stringify` and deserializes with `superjson.parse`. Sets `capabilities.transfer: false`. Generic over `TMessage` so the TypeScript type flows through `createTransport`.
+</Accordion>
+
+<Accordion title="superJsonLineCodec()">
+  Returns a newline-framed variant of `superJsonCodec`. Each encoded frame ends with `\n`; decoding trims trailing whitespace before passing to the base codec. Useful for line-oriented stream transports.
+</Accordion>

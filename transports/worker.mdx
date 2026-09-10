@@ -1,0 +1,188 @@
+---
+title: "Web Worker Transport for Type-Safe RPC Calls"
+sidebarTitle: "Web Worker"
+description: "Run typed RPC across Web Worker boundaries using workerTransport and workerSelfTransport, with full support for transferable objects and callback arguments."
+---
+
+The Web Worker transport is the simplest way to move work off the main thread while keeping a fully typed API surface. It wraps the native `postMessage()` / `addEventListener("message")` pair on both sides of a worker boundary, giving you bidirectional calls, callback arguments, and zero-copy transferable ownership moves through the same `transfer()` helper used everywhere else in kkrpc.
+
+Import from `kkrpc/worker`. The two factory functions cover the two sides of the boundary: `workerTransport(worker)` for the main thread and `workerSelfTransport()` for code running inside the worker global scope.
+
+## Transport capabilities
+
+| Capability | Supported |
+| --- | --- |
+| Bidirectional calls | ✅ |
+| Callback arguments | ✅ |
+| Transferable objects | ✅ |
+| Async iterable streaming | ✅ |
+
+## API
+
+<ParamField path="workerTransport" type="function">
+  Creates a transport for the main-thread side of a Web Worker. Accepts a standard `Worker` instance. Closing the transport terminates the worker via `worker.terminate()`.
+
+  ```typescript
+  import { workerTransport } from "kkrpc/worker"
+  workerTransport(worker: Worker): Transport<RPCMessage>
+  ```
+</ParamField>
+
+<ParamField path="workerSelfTransport" type="function">
+  Creates a transport for code running inside the worker global scope. Defaults to `globalThis`; pass a `WorkerScopeLike` object to override in tests. Closing calls `scope.close()` when it is available.
+
+  ```typescript
+  import { workerSelfTransport } from "kkrpc/worker"
+  workerSelfTransport(scope?: WorkerScopeLike): Transport<RPCMessage>
+  ```
+</ParamField>
+
+## Full example
+
+The pattern is: define the API type in the worker file, export it, then import it as a type in the main thread for `wrap<WorkerAPI>()`. No code generation and no schema files required.
+
+<CodeGroup>
+```typescript worker.ts
+import { expose } from "kkrpc"
+import { workerSelfTransport } from "kkrpc/worker"
+
+const api = {
+  async add(a: number, b: number): Promise<number> {
+    return a + b
+  },
+  async processBuffer(data: ArrayBuffer): Promise<number> {
+    return new Uint8Array(data).reduce((sum, byte) => sum + byte, 0)
+  },
+  async onProgress(
+    task: string,
+    callback: (percent: number) => void
+  ): Promise<void> {
+    for (let i = 0; i <= 100; i += 25) {
+      await new Promise((r) => setTimeout(r, 10))
+      callback(i)
+    }
+  }
+}
+
+export type WorkerAPI = typeof api
+
+expose(api, workerSelfTransport())
+```
+
+```typescript main.ts
+import { wrap, transfer } from "kkrpc"
+import { workerTransport } from "kkrpc/worker"
+import type { WorkerAPI } from "./worker"
+
+const worker = new Worker(new URL("./worker.ts", import.meta.url), {
+  type: "module"
+})
+const api = wrap<WorkerAPI>(workerTransport(worker))
+
+// Regular call
+console.log(await api.add(2, 3)) // 5
+
+// Zero-copy transferable
+const buffer = new ArrayBuffer(4)
+new Uint8Array(buffer).set([10, 20, 30, 40])
+const sum = await api.processBuffer(transfer(buffer, [buffer]))
+console.log(sum) // 100
+
+// Callback argument — the worker calls back into the main thread
+await api.onProgress("build", (percent) => {
+  console.log(`Progress: ${percent}%`)
+})
+```
+</CodeGroup>
+
+## Using RPCChannel for bidirectional APIs
+
+When the worker also needs to call back into the main thread (not just via callbacks but by initiating its own requests), use `RPCChannel` with `expose` on both sides.
+
+<CodeGroup>
+```typescript worker.ts
+import { RPCChannel } from "kkrpc"
+import { workerSelfTransport } from "kkrpc/worker"
+import type { MainAPI } from "./main"
+
+const workerAPI = {
+  async compute(n: number): Promise<number> {
+    // Call back into the main thread to log
+    await channel.getAPI().log(`Computing ${n}`)
+    return n * n
+  }
+}
+
+export type WorkerAPI = typeof workerAPI
+
+const channel = new RPCChannel<typeof workerAPI, MainAPI>(
+  workerSelfTransport(),
+  { expose: workerAPI }
+)
+```
+
+```typescript main.ts
+import { RPCChannel } from "kkrpc"
+import { workerTransport } from "kkrpc/worker"
+import type { WorkerAPI } from "./worker"
+
+const mainAPI = {
+  async log(message: string): Promise<void> {
+    console.log("[Worker]", message)
+  }
+}
+
+export type MainAPI = typeof mainAPI
+
+const worker = new Worker(new URL("./worker.ts", import.meta.url), {
+  type: "module"
+})
+
+const channel = new RPCChannel<MainAPI, WorkerAPI>(
+  workerTransport(worker),
+  { expose: mainAPI }
+)
+
+const remote = channel.getAPI()
+console.log(await remote.compute(7)) // 49
+```
+</CodeGroup>
+
+## Transferable objects
+
+The worker transport declares `transfer: true` in its capabilities, so `transfer()` envelopes are respected and the buffer ownership is moved rather than copied. Always include the transferable value in both the first argument and the transfers array.
+
+```typescript main.ts
+import { transfer } from "kkrpc"
+
+const buffer = new ArrayBuffer(1024 * 1024) // 1 MB
+// After this call, `buffer` is detached in the main thread.
+await api.processBuffer(transfer(buffer, [buffer]))
+```
+
+<Warning>
+  After transferring an `ArrayBuffer`, the originating side can no longer read or write the buffer. Any further access will throw a `TypeError`. Pass a copy if you need to retain local access.
+</Warning>
+
+## Closing the transport
+
+Calling the `ExposedController.dispose()` or `channel.destroy()` on the main-thread side will invoke `worker.terminate()`, which immediately stops the worker. Call `dispose` or `destroy` from the main thread once you are done with the worker to avoid memory leaks.
+
+```typescript main.ts
+import { expose } from "kkrpc"
+import { workerTransport } from "kkrpc/worker"
+import type { WorkerAPI } from "./worker"
+
+const worker = new Worker(new URL("./worker.ts", import.meta.url), {
+  type: "module"
+})
+
+const controller = expose({} as WorkerAPI, workerTransport(worker))
+
+// Terminate the worker when done
+controller.dispose()
+```
+
+<Note>
+  `workerSelfTransport()` reads `globalThis` by default. You can pass a custom `WorkerScopeLike` to the function when writing unit tests without a real worker environment.
+</Note>

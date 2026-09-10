@@ -1,0 +1,205 @@
+---
+title: "Runtime Validation with Standard Schema in kkRPC"
+sidebarTitle: "Validation"
+description: "Add input and output validation to exposed RPC methods using Zod, Valibot, or any Standard Schema-compatible library — no code generation required."
+---
+
+Runtime validation in kkRPC is opt-in and runs on the **server side** (the side that calls `expose`). The `validationPlugin` from `kkrpc/validation` integrates with any library that implements the [Standard Schema v1](https://standardschema.dev/) interface — Zod, Valibot, ArkType, and others all work out of the box. Input is validated before the local method executes, output is validated after it returns, and transformed values (coercion, defaults) are written back into the argument and result context before the caller receives them. Failures throw `RPCValidationError` which carries the failing phase, method name, and the raw schema issues.
+
+<Note>
+  Validation runs only on the side that calls `expose`. The `wrap`-side caller receives a deserialized `RPCValidationError` when the server rejects a call, just like any other remote error.
+</Note>
+
+## Two styles of usage
+
+kkRPC supports two complementary patterns. **Schema-first** lets the schemas define the TypeScript surface; **type-first** works from an existing interface and attaches validators in a separate map.
+
+<Tabs>
+  <Tab title="Schema-first (defineMethod)">
+    Use `defineMethod` to attach schemas directly to each method implementation. `defineAPI` wraps the object to preserve its shape for inference. `extractValidators` walks the API object and collects the hidden schema pairs. `InferAPI` derives the remote-callable TypeScript type from the schema definitions.
+
+    ```typescript server.ts
+    import { expose } from "kkrpc"
+    import {
+      defineAPI,
+      defineMethod,
+      extractValidators,
+      validationPlugin,
+      type InferAPI,
+    } from "kkrpc/validation"
+    import { webSocketTransport } from "kkrpc/ws"
+    import { WebSocketServer } from "ws"
+    import { z } from "zod"
+
+    const api = defineAPI({
+      add: defineMethod(
+        { input: z.tuple([z.number(), z.number()]), output: z.number() },
+        async (a, b) => a + b
+      ),
+      greet: defineMethod(
+        { input: z.tuple([z.string()]), output: z.string() },
+        async (name) => `Hello, ${name}`
+      ),
+    })
+
+    // Derive the remote API type automatically from the schemas
+    export type API = InferAPI<typeof api>
+
+    const wss = new WebSocketServer({ port: 3000 })
+    wss.on("connection", (socket) => {
+      expose(api, webSocketTransport(socket), {
+        plugins: [validationPlugin(extractValidators(api))],
+      })
+    })
+    ```
+
+    ```typescript client.ts
+    import { wrap } from "kkrpc"
+    import { webSocketClientTransport } from "kkrpc/ws"
+    import type { API } from "./server"
+
+    const remote = wrap<API>(webSocketClientTransport({ url: "ws://localhost:3000" }))
+
+    console.log(await remote.add(1, 2))     // 3
+    console.log(await remote.greet("World")) // "Hello, World"
+    ```
+  </Tab>
+  <Tab title="Type-first (ValidatorMap)">
+    If you already have a TypeScript interface and a plain implementation object, pass a typed `ValidatorMap<API>` directly to `validationPlugin`. The keys mirror the API object, and each leaf holds `input` and/or `output` schemas.
+
+    ```typescript server.ts
+    import { expose } from "kkrpc"
+    import { validationPlugin, type ValidatorMap } from "kkrpc/validation"
+    import { webSocketTransport } from "kkrpc/ws"
+    import { WebSocketServer } from "ws"
+    import { z } from "zod"
+
+    interface MathAPI {
+      add(a: number, b: number): Promise<number>
+      math: {
+        double(value: number): Promise<number>
+      }
+    }
+
+    const api: MathAPI = {
+      add: async (a, b) => a + b,
+      math: {
+        double: async (value) => value * 2,
+      },
+    }
+
+    const validators: ValidatorMap<MathAPI> = {
+      add: {
+        input: z.tuple([z.number(), z.number()]),
+        output: z.number(),
+      },
+      math: {
+        double: {
+          input: z.tuple([z.number()]),
+          output: z.number(),
+        },
+      },
+    }
+
+    const wss = new WebSocketServer({ port: 3000 })
+    wss.on("connection", (socket) => {
+      expose(api, webSocketTransport(socket), {
+        plugins: [validationPlugin<MathAPI>(validators)],
+      })
+    })
+    ```
+  </Tab>
+</Tabs>
+
+## Handling RPCValidationError
+
+When validation fails the channel rejects the call with an `RPCValidationError`. On the caller side you receive a deserialized error with the same name and properties. Use `isRPCValidationError` to narrow the type:
+
+```typescript client.ts
+import { wrap } from "kkrpc"
+import { isRPCValidationError } from "kkrpc/validation"
+import { webSocketClientTransport } from "kkrpc/ws"
+import type { API } from "./server"
+
+const remote = wrap<API>(webSocketClientTransport({ url: "ws://localhost:3000" }))
+
+try {
+  // Pass a string where a number is expected
+  await remote.add("oops" as unknown as number, 2)
+} catch (error) {
+  if (isRPCValidationError(error)) {
+    console.log(error.phase)   // "input"
+    console.log(error.method)  // "add"
+    console.log(error.issues)  // [{ message: "Expected number, received string" }]
+  }
+}
+```
+
+The `RPCValidationError` class exposes three properties:
+
+<ResponseField name="phase" type='"input" | "output"' required>
+  Whether the failure occurred before the method executed (`"input"`) or after it returned (`"output"`).
+</ResponseField>
+
+<ResponseField name="method" type="string" required>
+  The dot-joined method path that failed, e.g. `"math.double"`.
+</ResponseField>
+
+<ResponseField name="issues" type="ReadonlyArray<{ message: string; path?: ... }>" required>
+  The raw validation issues reported by the schema library.
+</ResponseField>
+
+## Callbacks and validation
+
+Callback function arguments are **filtered out** before input validation runs. The `input` schema for a method like `processTask(taskName: string, onProgress: (p: number) => void)` should only describe the serializable arguments — in this case `z.tuple([z.string()])`. The callback is passed through and invoked by the channel normally.
+
+```typescript
+const validators: ValidatorMap<ProgressAPI> = {
+  processTask: {
+    // Only validate serializable args; callbacks are excluded automatically
+    input: z.tuple([z.string()]),
+    output: z.array(z.object({ percent: z.number(), status: z.string() })),
+  },
+}
+```
+
+## Nested APIs
+
+Both `ValidatorMap` and `extractValidators` traverse nested objects recursively, so validators for `math.double` live under `validators.math.double`:
+
+```typescript
+const validators: ValidatorMap<API> = {
+  math: {
+    double: {
+      input: z.tuple([z.number()]),
+      output: z.number(),
+    },
+  },
+}
+```
+
+<Tip>
+  You only need to provide validators for the methods you want to guard. Methods without entries in the map are passed through without any validation.
+</Tip>
+
+## API reference
+
+<Accordion title="validationPlugin(validators)">
+  Creates an `RPCPlugin` that validates incoming call arguments and outgoing return values. Pass either a typed `ValidatorMap<API>` for type-first usage, or the result of `extractValidators(api)` for schema-first usage. Returns an object with `name: "validation"`, `onRequest`, and `onResponse` hooks.
+</Accordion>
+
+<Accordion title="defineMethod(schemas, handler)">
+  Attaches Standard Schema validators to a method implementation using a non-enumerable marker. `schemas` is an object with `input` and `output` schema fields. The returned function behaves as a normal async function; `extractValidators` reads the hidden marker to build the runtime validator map.
+</Accordion>
+
+<Accordion title="defineAPI(api)">
+  Identity function that preserves the API object's shape for TypeScript inference. Required so `InferAPI` can derive the remote-callable type from `DefinedMethod` entries.
+</Accordion>
+
+<Accordion title="extractValidators(api)">
+  Walks a schema-first API object and returns a nested `Record<string, unknown>` mapping method names to their validator pairs. Plain nested objects are traversed recursively; only leaves created by `defineMethod` contribute entries.
+</Accordion>
+
+<Accordion title="isRPCValidationError(error)">
+  Type predicate that returns `true` when `error` is an `RPCValidationError` (checks `error.name === "RPCValidationError"`). Use this to narrow caught errors on the caller side.
+</Accordion>

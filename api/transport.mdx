@@ -1,0 +1,350 @@
+---
+title: "Transport Interface and createTransport Composition"
+sidebarTitle: "Transport"
+description: "Reference for Transport, TransportCapabilities, Platform, Codec, and createTransport — compose wire platforms with codecs into typed RPC transports."
+---
+
+Every kkrpc transport is an implementation of the `Transport<TMessage>` interface: a minimal
+contract of `send`, `subscribe`, optional `close`, and an optional `onClose` hook. Most built-in
+transports are created for you by the subpath factories (e.g. `workerTransport`, `webSocketClientTransport`),
+but when you need to integrate a platform that kkrpc does not cover out of the box, or you want to
+compose a codec with a raw platform, the `createTransport` factory from `kkrpc/transport` is the
+right tool.
+
+## `Transport<TMessage>`
+
+```typescript
+interface Transport<TMessage> {
+  capabilities?: TransportCapabilities
+  send(message: TMessage, transfers?: Transferable[]): void | Promise<void>
+  subscribe(listener: (message: TMessage) => void): () => void
+  close?(): void
+  onClose?(listener: (reason?: Error) => void): () => void
+}
+```
+
+The message-level interface consumed directly by `RPCChannel`. `TMessage` is `RPCMessage` for all
+standard channels.
+
+<ParamField path="capabilities" type="TransportCapabilities">
+  Optional declaration of what the transport can do. `RPCChannel` reads `capabilities.transfer`
+  to decide whether to forward `TransferDescriptor` lists; `RemoteReferenceRPCChannel` reads
+  `capabilities.remoteRefs`. See [`TransportCapabilities`](#transportcapabilities) for every flag.
+</ParamField>
+
+<ParamField path="send" type="(message: TMessage, transfers?: Transferable[]) => void | Promise<void>" required>
+  Delivers one message to the remote endpoint. When the transport supports transferables, the
+  channel passes the collected `Transferable[]` from `transfer()` descriptors; otherwise an empty
+  array is passed. A returned `Promise` is awaited; if it rejects, the matching pending request is
+  rejected instead of waiting for a timeout.
+</ParamField>
+
+<ParamField path="subscribe" type="(listener: (message: TMessage) => void) => () => void" required>
+  Registers an inbound message listener and returns an unsubscribe callback. The channel calls the
+  unsubscribe function inside `destroy()`.
+</ParamField>
+
+<ParamField path="close" type="() => void">
+  Optional teardown hook called by `RPCChannel.destroy()`. Use it to close sockets, terminate
+  workers, or flush write buffers.
+</ParamField>
+
+<ParamField path="onClose" type="(listener: (reason?: Error) => void) => () => void">
+  Optionally register a one-shot listener that fires when the transport permanently stops
+  delivering messages due to a remote close or network error. It is **not** called for a local
+  `close()`. `reason` is `undefined` for a clean remote close, or an `Error` for abnormal
+  termination. When present, `RPCChannel` uses it to reject pending requests immediately rather
+  than waiting for their timeouts. Returns an unsubscribe function.
+
+  <Note>
+    Registering `onClose` after the transport has already closed invokes the listener
+    asynchronously with the recorded reason. Omitting `onClose` does not break the channel — it
+    just means pending requests wait for their timeouts instead of failing fast.
+  </Note>
+</ParamField>
+
+---
+
+## `TransportCapabilities`
+
+```typescript
+interface TransportCapabilities {
+  objectMode?: boolean
+  transfer?: boolean
+  broadcast?: boolean
+  remoteRefs?: boolean
+}
+```
+
+Capability flags declared on a `Transport`. Only `transfer` and `remoteRefs` drive branching in
+the core; the others are informational so applications can inspect them at runtime.
+
+<ParamField path="objectMode" type="boolean">
+  The transport carries JavaScript objects without string serialization (structured-clone-grade), so
+  non-JSON values such as `Date`, `Map`, and `undefined` survive round-trips. Transports that
+  JSON-serialize should report `false`. Informational — the core does not branch on this flag.
+</ParamField>
+
+<ParamField path="transfer" type="boolean">
+  The transport can forward transferables passed to `send(message, transfers)`. When `true` and
+  `RPCChannelOptions.enableTransfer !== false`, the channel forwards `TransferDescriptor` transfer
+  lists.
+</ParamField>
+
+<ParamField path="broadcast" type="boolean">
+  The transport may deliver messages to more than one peer (e.g. a BroadcastChannel). Informational
+  — the core does not branch on this flag.
+</ParamField>
+
+<ParamField path="remoteRefs" type="boolean">
+  The transport can carry bidirectional remote-reference request traffic required by
+  `kkrpc/remote-refs`. Must be `true` for the `RemoteReferenceRPCChannel` to operate.
+</ParamField>
+
+---
+
+## `Platform<TWire>`
+
+```typescript
+interface Platform<TWire> {
+  capabilities?: PlatformCapabilities
+  send(wire: TWire, transfers?: Transferable[]): void | Promise<void>
+  subscribe(listener: (wire: TWire) => void): () => void
+  close?(): void
+  onClose?(listener: (reason?: Error) => void): () => void
+}
+```
+
+The wire-level primitive passed to `createTransport`. A platform knows how to move raw wire values
+(`TWire`) for one runtime. The codec layered on top of it translates between `TWire` and
+`TMessage`.
+
+<ParamField path="capabilities" type="PlatformCapabilities">
+  Declares what the platform's wire layer can do. `createTransport` merges these with
+  `CodecCapabilities` to compute the composed transport's `TransportCapabilities`.
+</ParamField>
+
+<ParamField path="send" type="(wire: TWire, transfers?: Transferable[]) => void | Promise<void>" required>
+  Sends one encoded wire value. Transferables are forwarded only when both platform and codec
+  report `capabilities.transfer === true`.
+</ParamField>
+
+<ParamField path="subscribe" type="(listener: (wire: TWire) => void) => () => void" required>
+  Registers a listener for incoming wire values and returns an unsubscribe callback.
+</ParamField>
+
+<ParamField path="close" type="() => void">
+  Optional teardown hook forwarded to the composed transport's `close()`.
+</ParamField>
+
+<ParamField path="onClose" type="(listener: (reason?: Error) => void) => () => void">
+  Optional connection-close notification forwarded verbatim into the composed transport's `onClose`.
+  Same contract as `Transport.onClose`.
+</ParamField>
+
+---
+
+## `PlatformCapabilities`
+
+```typescript
+interface PlatformCapabilities {
+  objectMode?: boolean
+  transfer?: boolean
+}
+```
+
+<ParamField path="objectMode" type="boolean">
+  The platform wire value is already a JavaScript object (no string serialization needed).
+  Forwarded to the composed transport's `capabilities.objectMode` unless overridden.
+</ParamField>
+
+<ParamField path="transfer" type="boolean">
+  The platform's `send` method accepts and forwards transferables. Must be `true` together with
+  `CodecCapabilities.transfer` for the composed transport to enable transferable forwarding.
+</ParamField>
+
+---
+
+## `Codec<TMessage, TWire>`
+
+```typescript
+interface Codec<TMessage, TWire> {
+  capabilities?: CodecCapabilities
+  encode(message: TMessage): TWire
+  decode(wire: TWire): TMessage
+}
+```
+
+Translates between RPC messages and platform wire values. A codec is stateless by convention
+(one encode/decode call per message).
+
+<ParamField path="capabilities" type="CodecCapabilities">
+  Declares codec-level capabilities merged by `createTransport`.
+</ParamField>
+
+<ParamField path="encode" type="(message: TMessage) => TWire" required>
+  Converts an RPC message into the platform's native wire format (e.g. a JSON string, a
+  `Uint8Array`, or a plain object).
+</ParamField>
+
+<ParamField path="decode" type="(wire: TWire) => TMessage" required>
+  Converts one platform wire value back into an RPC message. When decoding fails and
+  `createTransport` was given an `onInvalidFrame` callback, the error is reported there and the
+  frame is dropped instead of propagating.
+</ParamField>
+
+---
+
+## `CodecCapabilities`
+
+```typescript
+interface CodecCapabilities {
+  transfer?: boolean
+}
+```
+
+<ParamField path="transfer" type="boolean">
+  The codec preserves transferred values without cloning or serializing them. Must be `true`
+  together with `PlatformCapabilities.transfer` for the composed transport to forward
+  transferables. A codec that JSON-serializes values should report `false` because transferables
+  cannot survive JSON serialization.
+</ParamField>
+
+---
+
+## `createTransport`
+
+```typescript
+import { createTransport } from "kkrpc/transport"
+
+function createTransport<TMessage, TWire>(options: {
+  platform: Platform<TWire>
+  codec: Codec<TMessage, TWire>
+  capabilities?: TransportCapabilities
+  onInvalidFrame?: (wire: TWire, error: unknown) => void
+}): Transport<TMessage>
+```
+
+Composes a wire-level platform and a message codec into a `Transport<TMessage>` ready for
+`RPCChannel`. Transfer support in the resulting transport is enabled **only** when both
+`platform.capabilities.transfer` and `codec.capabilities.transfer` are `true`. Capability
+overrides via the `capabilities` argument can only **downgrade** transfer to `false`; they cannot
+upgrade an unsafe pair.
+
+```typescript custom-transport.ts
+import { createTransport } from "kkrpc/transport"
+
+// Minimal platform backed by a custom event bus:
+const myPlatform = {
+  capabilities: { objectMode: true },
+  send(message: unknown) { eventBus.emit("rpc:out", message) },
+  subscribe(listener: (msg: unknown) => void) {
+    eventBus.on("rpc:in", listener)
+    return () => eventBus.off("rpc:in", listener)
+  }
+}
+
+// Identity codec for an object-mode platform:
+const passthroughCodec = {
+  encode: (msg: RPCMessage) => msg,
+  decode: (wire: unknown) => wire as RPCMessage
+}
+
+const transport = createTransport({
+  platform: myPlatform,
+  codec: passthroughCodec,
+  capabilities: { objectMode: true }
+})
+
+const channel = new RPCChannel(transport, { expose: localAPI })
+```
+
+<ParamField path="platform" type="Platform<TWire>" required>
+  The wire-level runtime primitive. Provides `send`, `subscribe`, and optional `close` / `onClose`.
+</ParamField>
+
+<ParamField path="codec" type="Codec<TMessage, TWire>" required>
+  Encoder/decoder pair that translates between `TMessage` and the platform's wire type.
+</ParamField>
+
+<ParamField path="capabilities" type="TransportCapabilities">
+  Optional overrides for the composed transport's advertised capabilities. Transfer can only be
+  downgraded here (setting `transfer: false` suppresses forwarding even when the platform and codec
+  both support it). Use `broadcast` and `remoteRefs` to advertise behavior not owned by the
+  platform/codec pair.
+</ParamField>
+
+<ParamField path="onInvalidFrame" type="(wire: TWire, error: unknown) => void">
+  Observe wire values that `codec.decode()` could not parse. When provided, decode errors are
+  reported here and the frame is silently dropped instead of propagating into the platform's
+  receive loop. Important for transports that may carry non-kkrpc or malformed frames — for
+  example a WebSocket shared with other protocols. Without it, decode errors propagate as before.
+</ParamField>
+
+---
+
+## Transfer Capability Rules
+
+The table below summarises when transferables flow end-to-end.
+
+| `platform.capabilities.transfer` | `codec.capabilities.transfer` | `capabilities.transfer` override | Transferables forwarded? |
+|---|---|---|---|
+| `true` | `true` | _(absent)_ | ✅ Yes |
+| `true` | `true` | `false` | ❌ No (overridden) |
+| `true` | `false` | — | ❌ No (codec can't preserve them) |
+| `false` | `true` | — | ❌ No (platform can't accept them) |
+| `false` | `false` | — | ❌ No |
+
+<Warning>
+  Setting `capabilities.transfer: true` when the platform or codec does not actually support
+  transferables leads to runtime errors or data corruption. The override can only downgrade to
+  `false`, not upgrade an unsafe pair.
+</Warning>
+
+---
+
+## Implementing a Custom Transport
+
+Use `createTransport` for anything that fits the platform-plus-codec model. For maximum control,
+implement the `Transport<RPCMessage>` interface directly:
+
+```typescript my-transport.ts
+import type { Transport } from "kkrpc"
+import type { RPCMessage } from "kkrpc"
+
+export function myCustomTransport(): Transport<RPCMessage> {
+  const listeners = new Set<(msg: RPCMessage) => void>()
+  let closeListener: ((reason?: Error) => void) | undefined
+
+  return {
+    capabilities: { objectMode: true, transfer: false },
+
+    send(message) {
+      // deliver to the remote side...
+      myChannel.postMessage(message)
+    },
+
+    subscribe(listener) {
+      listeners.add(listener)
+      myChannel.onmessage = (e) => listeners.forEach(l => l(e.data as RPCMessage))
+      return () => listeners.delete(listener)
+    },
+
+    close() {
+      myChannel.close()
+    },
+
+    onClose(listener) {
+      closeListener = listener
+      myChannel.onclose = () => listener(undefined)
+      return () => { myChannel.onclose = null }
+    }
+  }
+}
+```
+
+<Tip>
+  Keep `subscribe` idempotent with respect to the underlying runtime listener — register on the
+  runtime once and fan out to kkrpc listeners via a local `Set`, as shown above. This avoids
+  duplicate listeners when multiple channels share one transport.
+</Tip>

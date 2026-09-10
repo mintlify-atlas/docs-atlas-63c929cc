@@ -1,0 +1,265 @@
+---
+title: "Stdio Transport for Cross-Process RPC over Pipes"
+sidebarTitle: "Stdio"
+description: "Wire Node.js, Bun, or Deno processes together over newline-delimited JSON stdio using nodeStdioTransport, stdioJsonTransport, and related helpers."
+---
+
+The stdio transport serializes RPC messages as newline-delimited JSON and exchanges them over a readable stream (stdin) and a writable stream (stdout). It is the right choice for plugin hosts that spawn child processes, CLI tools, language interop wrappers, and any setup where two processes need bidirectional typed communication without a network socket.
+
+When a parent process spawns a child and wires `child.stdout → parent readable` and `child.stdin → parent writable`, the two sides form a full-duplex channel that supports bidirectional calls and callback arguments.
+
+## Transport capabilities
+
+| Capability | Supported |
+| --- | --- |
+| Bidirectional calls | ✅ |
+| Callback arguments | ✅ |
+| Transferable objects | ❌ |
+| Async iterable streaming | ✅ |
+
+## API
+
+<ParamField path="nodeStdioTransport" type="function">
+  The most convenient entry point. Reads `process.stdin` and writes to `process.stdout` by default. Pass explicit `readable` / `writable` streams to override, such as when wiring a spawned child process from the parent side.
+
+  ```typescript
+  import { nodeStdioTransport } from "kkrpc/stdio"
+  nodeStdioTransport(options?: Partial<StdioPlatformOptions>): Transport<RPCMessage>
+  ```
+</ParamField>
+
+<ParamField path="stdioJsonTransport" type="function">
+  Lower-level factory that accepts explicit `readable`, `writable`, and optional `lifecycle` streams. Use this when you need fine-grained control or when connecting streams that are not `process.stdin` / `process.stdout`. The `onInvalidFrame` callback lets you observe non-RPC lines without silently dropping them.
+
+  ```typescript
+  import { stdioJsonTransport } from "kkrpc/stdio"
+  stdioJsonTransport(options: StdioJsonTransportOptions): Transport<RPCMessage>
+  ```
+
+  **`StdioJsonTransportOptions`**
+  - `readable: ReadableLike` — stream emitting data chunks.
+  - `writable: WritableLike` — stream receiving encoded frames.
+  - `lifecycle?: StreamLifecycleLike` — source for `close` / `end` / `error` events; enables `onClose` on the transport.
+  - `onInvalidFrame?(frame, error?)` — called when a line is not a valid RPC frame.
+</ParamField>
+
+<ParamField path="stdioPlatform" type="function">
+  Creates the underlying string platform that `stdioJsonTransport` builds on. Useful when you need to compose the platform with a different codec or wrap it for testing.
+
+  ```typescript
+  import { stdioPlatform } from "kkrpc/stdio"
+  stdioPlatform(options: StdioPlatformOptions): Platform<string>
+  ```
+</ParamField>
+
+## Node.js: parent spawning a child process
+
+The child exposes an API over its own stdin/stdout. The parent spawns the child, wires the streams, and uses the typed proxy.
+
+<CodeGroup>
+```typescript child.ts
+import { expose } from "kkrpc"
+import { nodeStdioTransport } from "kkrpc/stdio"
+
+const api = {
+  async version(): Promise<string> {
+    return process.version
+  },
+  async add(a: number, b: number): Promise<number> {
+    return a + b
+  },
+  async greet(name: string): Promise<string> {
+    return `Hello from child, ${name}!`
+  }
+}
+
+export type ChildAPI = typeof api
+
+// Default: reads process.stdin, writes process.stdout
+expose(api, nodeStdioTransport())
+```
+
+```typescript parent.ts
+import { spawn } from "node:child_process"
+import { wrap } from "kkrpc"
+import { nodeStdioTransport } from "kkrpc/stdio"
+import type { ChildAPI } from "./child"
+
+const child = spawn("node", ["child.js"], {
+  stdio: ["pipe", "pipe", "inherit"] // stdin/stdout piped, stderr inherited
+})
+
+const api = wrap<ChildAPI>(
+  nodeStdioTransport({
+    readable: child.stdout,
+    writable: child.stdin
+  })
+)
+
+console.log(await api.version())        // e.g., v22.0.0
+console.log(await api.add(10, 32))      // 42
+console.log(await api.greet("World"))   // Hello from child, World!
+
+child.kill()
+```
+</CodeGroup>
+
+## Runtime variants
+
+All three runtimes use the same `nodeStdioTransport` function from `kkrpc/stdio`. The difference is only in how you adapt the runtime's stream types to the `ReadableLike` / `WritableLike` interface.
+
+<Tabs>
+  <Tab title="Node.js">
+    Node's `process.stdin` and `process.stdout` implement `ReadableLike` and `WritableLike` directly. No adaptation is needed.
+
+    ```typescript child.ts
+    import { expose } from "kkrpc"
+    import { nodeStdioTransport } from "kkrpc/stdio"
+
+    const api = {
+      async ping(): Promise<string> {
+        return "pong"
+      }
+    }
+
+    export type ChildAPI = typeof api
+
+    expose(api, nodeStdioTransport())
+    ```
+
+    ```typescript parent.ts
+    import { spawn } from "node:child_process"
+    import { wrap } from "kkrpc"
+    import { nodeStdioTransport } from "kkrpc/stdio"
+    import type { ChildAPI } from "./child"
+
+    const child = spawn("node", ["child.js"], { stdio: ["pipe", "pipe", "inherit"] })
+
+    const api = wrap<ChildAPI>(
+      nodeStdioTransport({ readable: child.stdout, writable: child.stdin })
+    )
+    console.log(await api.ping()) // pong
+    child.kill()
+    ```
+  </Tab>
+
+  <Tab title="Bun">
+    Bun's `process.stdin` and `process.stdout` expose the same Node-compatible stream interface, so `nodeStdioTransport()` works without any changes. When spawning a child from Bun, pass the stream instances explicitly.
+
+    ```typescript child.ts
+    import { expose } from "kkrpc"
+    import { nodeStdioTransport } from "kkrpc/stdio"
+
+    const api = {
+      async ping(): Promise<string> {
+        return "pong from bun"
+      }
+    }
+
+    export type ChildAPI = typeof api
+
+    expose(api, nodeStdioTransport())
+    ```
+
+    ```typescript parent.ts
+    import { wrap } from "kkrpc"
+    import { nodeStdioTransport } from "kkrpc/stdio"
+    import type { ChildAPI } from "./child"
+
+    const child = Bun.spawn(["bun", "run", "child.ts"], {
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "inherit"
+    })
+
+    const api = wrap<ChildAPI>(
+      nodeStdioTransport({
+        readable: child.stdout,
+        writable: child.stdin
+      })
+    )
+    console.log(await api.ping()) // pong from bun
+    child.kill()
+    ```
+  </Tab>
+
+  <Tab title="Deno">
+    Deno's `Deno.stdin` and `Deno.stdout` are `ReadableStream` / `WritableStream`. Use `stdioJsonTransport` with a reader/writer adapted to the `ReadableLike` / `WritableLike` interface, or use an `EventEmitter`-compatible shim.
+
+    ```typescript child.ts
+    import { expose } from "kkrpc"
+    import { stdioJsonTransport } from "kkrpc/stdio"
+
+    const api = {
+      async ping(): Promise<string> {
+        return "pong from deno"
+      }
+    }
+
+    export type ChildAPI = typeof api
+
+    // Adapt Deno.stdin/stdout to the ReadableLike/WritableLike interface
+    const readable = {
+      on(event: "data", listener: (chunk: Uint8Array) => void) {
+        ;(async () => {
+          for await (const chunk of Deno.stdin.readable) {
+            listener(chunk)
+          }
+        })()
+      },
+      off(_event: string, _listener: unknown) {}
+    }
+
+    const writable = {
+      write(chunk: string, callback?: (err?: Error | null) => void) {
+        const encoder = new TextEncoder()
+        Deno.stdout.write(encoder.encode(chunk)).then(
+          () => callback?.(),
+          (err) => callback?.(err)
+        )
+      }
+    }
+
+    expose(api, stdioJsonTransport({ readable, writable }))
+    ```
+  </Tab>
+</Tabs>
+
+## Observing non-RPC output
+
+Some child processes write plain text (logs, progress output) alongside RPC frames. Use `onInvalidFrame` to capture those lines separately without losing them.
+
+```typescript parent.ts
+import { nodeStdioTransport } from "kkrpc/stdio"
+
+const transport = nodeStdioTransport({
+  readable: child.stdout,
+  writable: child.stdin,
+  onInvalidFrame(frame, error) {
+    // Lines that are not valid JSON RPC frames end up here
+    process.stderr.write(`[child log] ${frame}`)
+  }
+})
+```
+
+## Connection lifecycle
+
+When you pass a `lifecycle` stream to `stdioJsonTransport`, the transport emits `onClose` when the stream ends or errors. This lets you detect child process exit cleanly.
+
+```typescript parent.ts
+import { stdioJsonTransport } from "kkrpc/stdio"
+
+const transport = stdioJsonTransport({
+  readable: child.stdout,
+  writable: child.stdin,
+  lifecycle: child.stdout // Node readable emits 'close' / 'end' / 'error'
+})
+
+transport.onClose?.((reason) => {
+  console.log("Child process exited", reason?.message ?? "(clean)")
+})
+```
+
+<Note>
+  `nodeStdioTransport()` automatically wires `process.stdin` as the lifecycle source when no explicit `readable` override is provided, giving you `onClose` for free in child processes.
+</Note>

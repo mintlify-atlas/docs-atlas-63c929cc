@@ -1,0 +1,210 @@
+---
+title: "Transport Relay: Bridging Two Transports Without an API"
+sidebarTitle: "Relay"
+description: "Use relayTransport(a, b) to forward raw RPC messages between two transports in both directions without the relay process needing to know either side's API."
+---
+
+A relay bridges two kkRPC transports so that messages flow bidirectionally between them without the relay process ever parsing or acting on the RPC calls themselves. The relay process is just a dumb pipe — it does not expose an API, does not deserialize arguments, and does not generate responses. This makes it the right tool for bridge processes, protocol gateway layers, or any scenario where a middle process should forward traffic between two endpoints that cannot connect directly.
+
+## When to Use a Relay
+
+Use `relayTransport` when:
+
+- A browser renderer cannot directly reach a background worker, but a main process can reach both.
+- A gateway process must forward WebSocket traffic to an internal subprocess over stdio.
+- You need to proxy RPC traffic through a cloud relay without that relay owning any API logic.
+- You want to chain two transports together in a test without writing a full stub API.
+
+If the bridge process needs to _call_ into the API or _expose_ its own methods, use `RPCChannel` or `expose()`/`wrap()` instead.
+
+## Basic Usage
+
+```typescript relay.ts
+import { relayTransport } from "kkrpc/relay"
+
+// Connect left and right transports
+const relay = relayTransport(leftTransport, rightTransport)
+
+// Stop forwarding when no longer needed
+relay.dispose()
+```
+
+`relayTransport` returns a `RelayController` with a single `dispose()` method. After `dispose()` is called, no further messages are forwarded in either direction and all internal subscriptions are cleaned up.
+
+## `relayTransport` Options
+
+<ParamField body="left" type="Transport<RPCMessage>" required>
+  The first transport. Messages arriving here are forwarded to `right`, and messages arriving on `right` are forwarded here.
+</ParamField>
+
+<ParamField body="right" type="Transport<RPCMessage>" required>
+  The second transport. Bidirectional forwarding — neither side is privileged.
+</ParamField>
+
+<ParamField body="options.onClose" type="(side: 'left' | 'right', reason?: Error) => void">
+  Called once after the relay auto-disposes because one side's connection closed. Requires the closing transport to implement `onClose`. `reason` is an `Error` for abnormal termination, `undefined` for a clean close.
+</ParamField>
+
+<ParamField body="options.closeOtherSide" type="boolean">
+  When `true`, closing one side also calls `close()` on the surviving side. Defaults to `false`.
+</ParamField>
+
+## Relay Controller
+
+```typescript
+interface RelayController {
+  dispose(): void   // stop forwarding and unsubscribe from both transports
+}
+```
+
+Calling `dispose()` is idempotent. Calling it multiple times has no effect after the first call.
+
+## Bidirectional Forwarding
+
+Messages flow symmetrically. When a message arrives on `left`, it is sent to `right`. When a message arrives on `right`, it is sent to `left`. Transfer-capable targets receive transferable objects extracted from the message payload automatically.
+
+```typescript relay-process.ts
+// Electron main process bridging renderer ↔ worker
+import { ipcMainTransport } from "kkrpc/electron"
+import { workerTransport } from "kkrpc/worker"
+import { relayTransport } from "kkrpc/relay"
+
+const rendererTransport = ipcMainTransport()
+const worker = new Worker(new URL("./worker.js", import.meta.url))
+const wTransport = workerTransport(worker)
+
+const relay = relayTransport(rendererTransport, wTransport)
+
+// The main process forwards all traffic without knowing the API
+// Renderer calls go through to worker, worker responses go back to renderer
+```
+
+## Auto-Dispose on Connection Close
+
+When one of the transports implements `onClose`, the relay registers listeners on both sides. If either side closes, the relay automatically disposes itself and calls `options.onClose` if provided.
+
+```typescript relay-with-close.ts
+import { webSocketClientTransport } from "kkrpc/ws"
+import { nodeStdioTransport } from "kkrpc/stdio"
+import { relayTransport } from "kkrpc/relay"
+import { ChildProcess } from "node:child_process"
+
+function bridgeSocketToStdio(socket: WebSocket, child: ChildProcess) {
+  const wsTransport = webSocketClientTransport({ url: "ws://internal-service" })
+  const stdioTransport = nodeStdioTransport({
+    readable: child.stdout!,
+    writable: child.stdin!
+  })
+
+  const relay = relayTransport(wsTransport, stdioTransport, {
+    closeOtherSide: true,
+    onClose(side, reason) {
+      console.log(`Relay closed because ${side} disconnected`, reason)
+      child.kill()
+    }
+  })
+
+  return relay
+}
+```
+
+## Complete Example: Gateway Bridge
+
+This example shows a minimal Node.js bridge process that receives WebSocket connections and forwards each one to a dedicated child process over stdio. The bridge process never needs to know the API shape.
+
+```typescript gateway.ts
+import { createServer } from "node:http"
+import { spawn } from "node:child_process"
+import { WebSocketServer } from "ws"
+import { webSocketTransport } from "kkrpc/ws"
+import { nodeStdioTransport } from "kkrpc/stdio"
+import { relayTransport } from "kkrpc/relay"
+
+const httpServer = createServer()
+const wss = new WebSocketServer({ server: httpServer })
+
+wss.on("connection", (socket) => {
+  // Spawn a fresh worker for each connection
+  const child = spawn("node", ["worker.js"], {
+    stdio: ["pipe", "pipe", "inherit"]
+  })
+
+  const wsTransport = webSocketTransport(socket)
+  const stdioTransport = nodeStdioTransport({
+    readable: child.stdout!,
+    writable: child.stdin!
+  })
+
+  // Relay messages between WebSocket and stdio without parsing them
+  const relay = relayTransport(wsTransport, stdioTransport, {
+    closeOtherSide: true,
+    onClose(side, reason) {
+      console.log(`[gateway] connection closed from ${side}`, reason?.message)
+    }
+  })
+
+  socket.on("close", () => relay.dispose())
+  child.on("exit", () => relay.dispose())
+})
+
+httpServer.listen(3000)
+```
+
+```typescript worker.ts
+import { expose } from "kkrpc"
+import { nodeStdioTransport } from "kkrpc/stdio"
+
+const api = {
+  async compute(input: number) {
+    return input * input
+  }
+}
+
+export type WorkerAPI = typeof api
+
+expose(api, nodeStdioTransport({
+  readable: process.stdin,
+  writable: process.stdout
+}))
+```
+
+```typescript client.ts
+import { wrap } from "kkrpc"
+import { webSocketClientTransport } from "kkrpc/ws"
+import type { WorkerAPI } from "./worker"
+
+const remote = wrap<WorkerAPI>(
+  webSocketClientTransport({ url: "ws://localhost:3000" })
+)
+
+console.log(await remote.compute(12)) // 144
+```
+
+<Note>
+  The gateway process imports only `kkrpc/relay`, `kkrpc/ws`, and `kkrpc/stdio`. It never imports the `WorkerAPI` type and has no knowledge of the API shape.
+</Note>
+
+## Relay vs Full Channel
+
+| Scenario | Use |
+|---|---|
+| Bridge process just forwards traffic | `relayTransport` |
+| Bridge process also exposes its own methods | `RPCChannel` with two transports (manual) |
+| Both sides call each other | `RPCChannel` with `expose` on both |
+| One-shot unidirectional proxy | `relayTransport` |
+| Bridge needs to inspect or transform messages | Custom transport + `RPCChannel` |
+
+## Transferable Forwarding
+
+When the destination transport advertises `capabilities.transfer === true`, the relay automatically collects transferable objects found in the message payload (such as `ArrayBuffer`, `MessagePort`, `ReadableStream`) and forwards them in the `send()` call. This preserves zero-copy semantics across the relay boundary.
+
+```typescript
+// Right transport supports transferables
+const right = new MemoryTransport({ transfer: true })
+const relay = relayTransport(left, right)
+
+// ArrayBuffer in the message payload is forwarded as a transferable
+const buffer = new ArrayBuffer(8)
+left.emit({ t: "q", id: "1", op: "call", p: ["take"], a: [buffer] })
+// right.send is called with buffer in the transfers array
+```

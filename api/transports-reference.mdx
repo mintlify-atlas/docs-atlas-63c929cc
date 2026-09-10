@@ -1,0 +1,813 @@
+---
+title: "Transport Factory API Reference for kkRPC"
+sidebarTitle: "Transport Factories"
+description: "Complete signatures, option types, and capability flags for every kkRPC transport factory — from Web Workers and WebSockets to Kafka and NATS."
+---
+
+Every kkRPC transport is a value that implements the `Transport<RPCMessage>` interface: a `send()` method, a `subscribe()` method, and an optional `close()`. Factories in this reference construct ready-to-use transports from runtime primitives such as sockets, ports, streams, or broker connections. Each section shows the exact TypeScript signature extracted from the source, the options type where relevant, and the `TransportCapabilities` flags the factory reports.
+
+## Quick Reference
+
+The table below maps each factory to its import path and its four capability flags. `objectMode` means the wire carries JavaScript objects without JSON serialization. `transfer` means transferable ownership moves (e.g. `ArrayBuffer`) are forwarded. `broadcast` means the transport may deliver a message to more than one peer. `remoteRefs` means the channel can carry bidirectional remote-reference traffic.
+
+| Transport | Import path | Factory | objectMode | transfer | broadcast | remoteRefs |
+|---|---|---|:---:|:---:|:---:|:---:|
+| Worker (main thread) | `kkrpc/worker` | `workerTransport` | ✓ | ✓ | — | ✓ |
+| Worker (self) | `kkrpc/worker` | `workerSelfTransport` | ✓ | ✓ | — | ✓ |
+| WebSocket (raw) | `kkrpc/ws` | `webSocketTransport` | — | — | — | ✓ |
+| WebSocket (client) | `kkrpc/ws` | `webSocketClientTransport` | — | — | — | ✓ |
+| Hono WS | `kkrpc/ws/hono` | `honoWebSocketTransport` | — | — | — | ✓ |
+| Elysia WS | `kkrpc/ws/elysia` | `elysiaWebSocketTransport` | — | — | — | ✓ |
+| HTTP handler | `kkrpc/http` | `createHttpHandler` | — | — | — | — |
+| HTTP client | `kkrpc/http` | `httpClientTransport` | — | — | — | — |
+| Node stdio | `kkrpc/stdio` | `nodeStdioTransport` | — | — | — | ✓ |
+| stdio JSON | `kkrpc/stdio` | `stdioJsonTransport` | — | — | — | ✓ |
+| iframe (parent) | `kkrpc/iframe` | `iframeParentTransport` | ✓ | ✓ | — | ✓ |
+| iframe (child) | `kkrpc/iframe` | `iframeChildTransport` | ✓ | ✓ | — | ✓ |
+| Chrome extension | `kkrpc/chrome-extension` | `chromePortTransport` | ✓ | — | — | ✓ |
+| Electron IPC | `kkrpc/electron` | `electronIpcTransport` | ✓ | — | — | ✓ |
+| Electron utility | `kkrpc/electron` | `electronUtilityProcessTransport` | ✓ | — | — | ✓ |
+| Tauri shell | `kkrpc/tauri` | `tauriShellStdioTransport` | — | — | — | ✓ |
+| Socket.IO | `kkrpc/socketio` | `socketIoTransport` | ✓ | — | — | ✓ |
+| Kafka | `kkrpc/kafka` | `kafkaTransport` | ✓ | — | broadcast* | remoteRefs* |
+| RabbitMQ | `kkrpc/rabbitmq` | `rabbitMqTransport` | ✓ | — | broadcast* | remoteRefs* |
+| Redis Streams | `kkrpc/redis-streams` | `redisStreamsTransport` | ✓ | — | broadcast* | remoteRefs* |
+| NATS | `kkrpc/nats` | `natsTransport` | ✓ | — | broadcast* | remoteRefs* |
+
+<Note>
+For Kafka, RabbitMQ, Redis Streams, and NATS the `broadcast` and `remoteRefs` flags are dynamic: `broadcast: true` and `remoteRefs: false` when no `remotePeerId` is set, and `broadcast: false` and `remoteRefs: true` when a `remotePeerId` is provided.
+</Note>
+
+---
+
+## `kkrpc/worker`
+
+Web Worker transports wrap `postMessage()` endpoints on either side of a worker boundary. They support object-mode messages and transferables.
+
+```typescript worker.ts
+import { workerTransport, workerSelfTransport } from "kkrpc/worker"
+
+function workerTransport(worker: Worker): Transport<RPCMessage>
+
+function workerSelfTransport(
+  scope?: WorkerScopeLike  // defaults to globalThis
+): Transport<RPCMessage>
+```
+
+```typescript worker-types.ts
+interface MessageTargetLike {
+  postMessage(message: RPCMessage, transfer?: Transferable[]): void
+  addEventListener(type: "message", listener: (event: MessageEvent<RPCMessage>) => void): void
+  removeEventListener(type: "message", listener: (event: MessageEvent<RPCMessage>) => void): void
+}
+
+interface WorkerScopeLike extends MessageTargetLike {
+  close?(): void
+}
+```
+
+**Capabilities:** `{ objectMode: true, transfer: true, remoteRefs: true }`
+
+Closing a `workerTransport` calls `worker.terminate()`. Closing a `workerSelfTransport` calls `scope.close()` when available.
+
+---
+
+## `kkrpc/ws`
+
+WebSocket transports send JSON-encoded messages over a persistent full-duplex socket. They support bidirectional calls and callback arguments, but not transferables. Messages sent before the socket opens are queued and flushed on `open`.
+
+```typescript ws.ts
+import {
+  webSocketTransport,
+  webSocketClientTransport,
+  type WebSocketLike,
+  type WebSocketClientTransportOptions,
+} from "kkrpc/ws"
+
+function webSocketTransport(socket: WebSocketLike): Transport<RPCMessage>
+
+function webSocketClientTransport(
+  options: WebSocketClientTransportOptions
+): Transport<RPCMessage>
+```
+
+```typescript ws-types.ts
+interface WebSocketLike {
+  readyState?: number
+  send(data: string): void
+  close(): void
+  onmessage?: unknown
+  onopen?: unknown
+  onclose?: unknown
+  onerror?: unknown
+  addEventListener?: unknown
+  removeEventListener?: unknown
+  on?: unknown
+  off?: unknown
+  removeListener?: unknown
+}
+
+interface WebSocketClientTransportOptions {
+  /** WebSocket URL to connect to. */
+  url: string
+  /** Optional protocols passed to the WebSocket constructor. */
+  protocols?: string | string[]
+}
+```
+
+**Capabilities:** `{ objectMode: false, transfer: false, remoteRefs: true }`
+
+`webSocketClientTransport` creates a new browser `WebSocket` from `options.url`. Use `webSocketTransport` when you already hold a socket instance (e.g. an accepted server-side socket in Node, Bun, or Deno).
+
+The transport also exposes an `onClose` hook that fires when the remote side drops the connection, enabling `RPCChannel` to reject pending requests immediately rather than waiting for their timeouts.
+
+---
+
+## `kkrpc/ws/hono`
+
+Hono delivers accepted WebSocket messages through framework lifecycle callbacks rather than a standard event emitter. This transport returns a `FeedableHonoWebSocketTransport` — you call `transport.feed(event.data)` from the Hono `onMessage` callback to push data in.
+
+```typescript ws-hono.ts
+import {
+  honoWebSocketTransport,
+  createHonoWebSocketHandler,
+  type HonoWebSocketContextLike,
+  type FeedableHonoWebSocketTransport,
+  type HonoWebSocketOptions,
+  type HonoWebSocketHandlerEvents,
+} from "kkrpc/ws/hono"
+
+function honoWebSocketTransport(
+  ws: HonoWebSocketContextLike
+): FeedableHonoWebSocketTransport
+
+function createHonoWebSocketHandler<LocalAPI extends object>(
+  options: HonoWebSocketOptions<LocalAPI>
+): HonoWebSocketHandlerEvents
+```
+
+```typescript ws-hono-types.ts
+interface HonoWebSocketContextLike {
+  send(message: string): void
+  close(): void
+}
+
+interface FeedableHonoWebSocketTransport extends Transport<RPCMessage> {
+  /** Push a framework-delivered message into the transport. */
+  feed(message: unknown): void
+}
+
+interface HonoWebSocketOptions<LocalAPI extends object> {
+  /** Local API object exposed to each WebSocket client. */
+  expose: LocalAPI
+  /** Per-channel RPC timeout in milliseconds. */
+  timeout?: number
+}
+
+interface HonoWebSocketHandlerEvents {
+  onOpen(_event: Event, ws: HonoWebSocketContextLike): void
+  onMessage(event: { data: unknown }): void
+  onClose(): void
+  onError(): void
+}
+```
+
+**Capabilities:** `{ objectMode: false, transfer: false, remoteRefs: true }`
+
+`createHonoWebSocketHandler` is the convenience wrapper that creates a channel per connection automatically. Use `honoWebSocketTransport` directly when you need fine-grained control over channel construction.
+
+---
+
+## `kkrpc/ws/elysia`
+
+Elysia routes WebSocket lifecycle events through framework callbacks, similar to Hono. Each socket gets its own feedable transport stored in a `WeakMap`. The `feed()` method parses and delivers incoming messages.
+
+```typescript ws-elysia.ts
+import {
+  elysiaWebSocketTransport,
+  createElysiaWebSocketHandler,
+  type ElysiaSocketLike,
+  type FeedableElysiaWebSocketTransport,
+  type ElysiaWebSocketOptions,
+} from "kkrpc/ws/elysia"
+
+function elysiaWebSocketTransport(
+  ws: ElysiaSocketLike
+): FeedableElysiaWebSocketTransport
+
+function createElysiaWebSocketHandler<LocalAPI extends object>(
+  options: ElysiaWebSocketOptions<LocalAPI>
+): {
+  open(ws: ElysiaSocketLike): void
+  message(ws: ElysiaSocketLike, message: unknown): void
+  close(ws: ElysiaSocketLike): void
+}
+```
+
+```typescript ws-elysia-types.ts
+interface ElysiaSocketLike {
+  raw?: object
+  data?: object
+  send(message: string): void
+  close(): void
+}
+
+interface FeedableElysiaWebSocketTransport extends Transport<RPCMessage> {
+  feed(message: unknown): void
+}
+
+interface ElysiaWebSocketOptions<LocalAPI extends object> {
+  expose: LocalAPI
+  timeout?: number
+}
+```
+
+**Capabilities:** `{ objectMode: false, transfer: false, remoteRefs: true }`
+
+---
+
+## `kkrpc/http`
+
+HTTP maps each RPC request to a single `POST` request and a single JSON response. It does not support callback arguments, remote references, or server-initiated calls. Use WebSockets instead when bidirectionality is required.
+
+```typescript http.ts
+import {
+  httpClientTransport,
+  createHttpHandler,
+  type HttpClientTransportOptions,
+  type HttpHandlerOptions,
+} from "kkrpc/http"
+
+function httpClientTransport(
+  options: HttpClientTransportOptions
+): Transport<RPCMessage>
+
+function createHttpHandler<LocalAPI extends object>(
+  api: LocalAPI,
+  options?: HttpHandlerOptions
+): (request: Request) => Promise<Response>
+```
+
+```typescript http-types.ts
+interface HttpClientTransportOptions {
+  /** Absolute or relative endpoint URL that accepts RPC POST requests. */
+  url: string
+  /** Headers merged with the default JSON content type. */
+  headers?: Record<string, string>
+  /** Fetch implementation to use; defaults to global fetch. */
+  fetch?: typeof fetch
+}
+
+interface HttpHandlerOptions {
+  /** Request-scoped RPC timeout in milliseconds. */
+  timeout?: number
+}
+```
+
+**Capabilities:** `{ objectMode: false, transfer: false, remoteRefs: false }`
+
+`createHttpHandler` returns a standard Fetch API `(request: Request) => Promise<Response>` handler. It is compatible with any runtime that provides the Fetch API — Node 18+, Deno, Bun, Cloudflare Workers, and similar. A request-scoped channel is created and immediately destroyed after each response.
+
+<Warning>
+The HTTP transport rejects function arguments, remote-reference envelopes, and async-iterable streams. Passing any of those will throw an `Error` on the client or return an error response from the handler.
+</Warning>
+
+---
+
+## `kkrpc/stdio`
+
+Stdio transports wrap Node-style readable and writable streams, exchanging newline-delimited JSON frames. They are bidirectional when two processes wire `stdin`/`stdout` to each other and support callback arguments.
+
+```typescript stdio.ts
+import {
+  nodeStdioTransport,
+  stdioJsonTransport,
+  stdioPlatform,
+  type StdioPlatformOptions,
+  type StdioJsonTransportOptions,
+  type ReadableLike,
+  type WritableLike,
+  type StreamLifecycleLike,
+} from "kkrpc/stdio"
+
+// Node.js: auto-binds process.stdin / process.stdout
+function nodeStdioTransport(
+  options?: Partial<StdioPlatformOptions>
+): Transport<RPCMessage>
+
+// Generic JSON-line transport for any readable/writable pair
+function stdioJsonTransport(
+  options: StdioJsonTransportOptions
+): Transport<RPCMessage>
+
+// Low-level string platform (use with createTransport + a codec)
+function stdioPlatform(options: StdioPlatformOptions): Platform<string>
+```
+
+```typescript stdio-types.ts
+interface ReadableLike {
+  on(event: "data", listener: (chunk: Uint8Array | string) => void): unknown
+  off(event: "data", listener: (chunk: Uint8Array | string) => void): this
+}
+
+interface WritableLike {
+  write(chunk: string, callback?: (error?: Error | null) => void): unknown
+  end?(): unknown
+}
+
+interface StreamLifecycleLike {
+  on(event: "close" | "end" | "error", listener: (...args: unknown[]) => void): unknown
+  off?(event: "close" | "end" | "error", listener: (...args: unknown[]) => void): unknown
+}
+
+interface StdioPlatformOptions {
+  readable: ReadableLike
+  writable: WritableLike
+  /** Optional lifecycle source enabling onClose on the transport. */
+  lifecycle?: StreamLifecycleLike
+}
+
+interface StdioJsonTransportOptions extends StdioPlatformOptions {
+  /** Observe stdout lines that are not valid RPC frames. */
+  onInvalidFrame?(frame: string, error?: unknown): void
+}
+```
+
+**Capabilities:** `{ objectMode: false, transfer: false, remoteRefs: true }`
+
+`nodeStdioTransport` reads `process.stdin` and writes `process.stdout` by default. Pass explicit streams in tests or embedded runtimes. For Deno or Bun, use `stdioJsonTransport` with your runtime's readable/writable streams.
+
+<Tip>
+Use `onInvalidFrame` in `stdioJsonTransport` to capture non-RPC lines written to stdout (e.g. log output) without crashing the transport.
+</Tip>
+
+---
+
+## `kkrpc/iframe`
+
+iframe transports use a `MessageChannel` handshake to upgrade from window-to-window `postMessage` to a direct `MessagePort`. After the handshake, messages and transferables flow through the port. If `MessageChannel` is unavailable, the transport falls back to window `postMessage` without transferable support.
+
+```typescript iframe.ts
+import {
+  iframeParentTransport,
+  iframeParentTransportReady,
+  iframeChildTransport,
+  iframeChildTransportReady,
+  type IframeTransportOptions,
+  type WindowLike,
+} from "kkrpc/iframe"
+
+// Parent window side
+function iframeParentTransport(
+  targetWindow: Window,
+  options?: IframeTransportOptions
+): Transport<RPCMessage>
+
+// Resolves once the MessagePort handshake completes
+function iframeParentTransportReady(
+  targetWindow: Window,
+  options?: IframeTransportOptions
+): Promise<Transport<RPCMessage>>
+
+// Child (inside iframe) side
+function iframeChildTransport(
+  options?: IframeTransportOptions
+): Transport<RPCMessage>
+
+// Resolves once the MessagePort handshake completes
+function iframeChildTransportReady(
+  options?: IframeTransportOptions
+): Promise<Transport<RPCMessage>>
+```
+
+```typescript iframe-types.ts
+interface IframeTransportOptions {
+  /** Allowed peer origin, or "*" for any origin. */
+  targetOrigin?: string
+  /** Source window to subscribe on. Defaults to globalThis. */
+  sourceWindow?: WindowLike
+  /** Callback invoked when the MessagePort handshake completes. */
+  onReady?: () => void
+  /**
+   * Maximum time to keep retrying the child→parent MessagePort handshake.
+   * Defaults to 30000ms. On timeout, onClose fires with an error.
+   */
+  handshakeTimeoutMs?: number
+}
+```
+
+**Capabilities (after handshake):** `{ objectMode: true, transfer: true, remoteRefs: true }`
+
+The `*Ready` variants return a `Promise` that resolves only after the `MessagePort` handshake completes, ensuring the first `send()` uses the port rather than the window fallback.
+
+<Note>
+Messages queued before the handshake completes are flushed automatically once the `MessagePort` is established. The child transport retries the handshake with exponential backoff up to `handshakeTimeoutMs`.
+</Note>
+
+---
+
+## `kkrpc/chrome-extension`
+
+Chrome extension messaging uses `chrome.runtime.Port` objects for persistent connections between extension pages, service workers, and content scripts. This transport wraps a port in the kkRPC contract.
+
+```typescript chrome-extension.ts
+import {
+  chromePortTransport,
+  type ChromePortLike,
+} from "kkrpc/chrome-extension"
+
+function chromePortTransport(port: ChromePortLike): Transport<RPCMessage>
+```
+
+```typescript chrome-extension-types.ts
+interface ChromePortLike {
+  postMessage(message: RPCMessage): void
+  onMessage: {
+    addListener(listener: (message: RPCMessage) => void): void
+    removeListener(listener: (message: RPCMessage) => void): void
+  }
+  onDisconnect?: {
+    addListener(listener: () => void): void
+    removeListener(listener: () => void): void
+  }
+  disconnect?(): void
+}
+```
+
+**Capabilities:** `{ objectMode: true, transfer: false, remoteRefs: true }`
+
+The transport listens for `onDisconnect` and automatically cleans up listeners when the port disconnects. Calling `close()` on the transport invokes `port.disconnect()`.
+
+---
+
+## `kkrpc/electron`
+
+Electron transports cover both IPC channel communication (main ↔ renderer via `ipcMain`/`ipcRenderer`) and the utility process channel (`process.parentPort`). A `createSecureIpcBridge` helper narrows the IPC surface in preload scripts.
+
+```typescript electron.ts
+import {
+  electronIpcTransport,
+  electronUtilityProcessTransport,
+  electronUtilityProcessChildTransport,
+  createSecureIpcBridge,
+  type ElectronTransportOptions,
+  type ElectronMessageEndpoint,
+  type ElectronUtilityProcessEndpoint,
+  type SecureIpcBridgeOptions,
+  type SecureIpcBridge,
+} from "kkrpc/electron"
+
+function electronIpcTransport(
+  options: ElectronTransportOptions
+): Transport<RPCMessage>
+
+function electronUtilityProcessTransport(
+  endpoint: ElectronUtilityProcessEndpoint
+): Transport<RPCMessage>
+
+function electronUtilityProcessChildTransport(
+  endpoint?: ElectronUtilityProcessChildEndpoint
+): Transport<RPCMessage>
+
+function createSecureIpcBridge(
+  options: SecureIpcBridgeOptions
+): SecureIpcBridge
+```
+
+```typescript electron-types.ts
+interface ElectronTransportOptions {
+  /** Electron endpoint or preload bridge to send and receive through. */
+  endpoint: ElectronMessageEndpoint
+  /** IPC channel name. Defaults to "kkrpc:message". */
+  channel?: string
+}
+
+interface ElectronMessageEndpoint {
+  send(channel: string, message: RPCMessage): void
+  on(channel: string, listener: (_event: unknown, message: RPCMessage) => void): void
+  off(channel: string, listener: (_event: unknown, message: RPCMessage) => void): void
+}
+
+interface ElectronUtilityProcessEndpoint {
+  postMessage(message: RPCMessage): void
+  on(event: "message", listener: (message: RPCMessage) => void): void
+  off(event: "message", listener: (message: RPCMessage) => void): void
+  kill?(): unknown
+}
+
+interface SecureIpcBridgeOptions {
+  /** Raw Electron renderer endpoint to wrap. */
+  ipcRenderer: ElectronMessageEndpoint
+  /** Explicit channel allow-list. */
+  allowedChannels?: string[]
+  /** Channel prefix that is allowed in addition to explicit channels. */
+  channelPrefix?: string
+}
+```
+
+**Capabilities:** `{ objectMode: true, transfer: false, remoteRefs: true }`
+
+`electronUtilityProcessChildTransport` defaults to `process.parentPort` when no endpoint is passed. `createSecureIpcBridge` requires at least one of `allowedChannels` or `channelPrefix`.
+
+---
+
+## `kkrpc/tauri`
+
+The Tauri transport wraps a shell child process's stdout and stdin using the `stdioJsonTransport` primitive internally. Communication is over newline-delimited JSON, identical to the Node stdio transport.
+
+```typescript tauri.ts
+import {
+  tauriShellStdioTransport,
+  type TauriShellStdioTransportOptions,
+  type TauriShellStdout,
+  type TauriShellChild,
+} from "kkrpc/tauri"
+
+function tauriShellStdioTransport(
+  options: TauriShellStdioTransportOptions
+): Transport<RPCMessage>
+```
+
+```typescript tauri-types.ts
+interface TauriShellStdout {
+  on(event: "data", listener: (chunk: Uint8Array | string) => void): unknown
+  off(event: "data", listener: (chunk: Uint8Array | string) => void): this
+}
+
+interface TauriShellChild {
+  write(chunk: string): unknown
+}
+
+interface TauriShellStdioTransportOptions {
+  /** Child stdout stream to read incoming frames from. */
+  stdout: TauriShellStdout
+  /** Child process handle used for outgoing writes. */
+  child: TauriShellChild
+}
+```
+
+**Capabilities:** `{ objectMode: false, transfer: false, remoteRefs: true }`
+
+---
+
+## `kkrpc/socketio`
+
+Socket.IO already provides a bidirectional event channel. This adapter sends compact RPC messages on a dedicated `"kkrpc:message"` event name and works with both client and server socket instances.
+
+```typescript socketio.ts
+import {
+  socketIoTransport,
+  SOCKET_IO_EVENT,
+  type SocketLike,
+} from "kkrpc/socketio"
+
+function socketIoTransport(socket: SocketLike): Transport<RPCMessage>
+
+const SOCKET_IO_EVENT = "kkrpc:message"
+```
+
+```typescript socketio-types.ts
+interface SocketLike {
+  emit(event: typeof SOCKET_IO_EVENT, message: RPCMessage): void
+  on(event: typeof SOCKET_IO_EVENT, listener: (message: RPCMessage) => void): void
+  off(event: typeof SOCKET_IO_EVENT, listener: (message: RPCMessage) => void): void
+  disconnect?(): void
+}
+```
+
+**Capabilities:** `{ objectMode: true, transfer: false, remoteRefs: true }`
+
+Calling `close()` invokes `socket.disconnect()` when the socket exposes it.
+
+---
+
+## `kkrpc/kafka`
+
+Kafka transports wrap RPC messages in bus envelopes and filter self-delivery or messages addressed to other peers. The producer and consumer connect lazily on first use and disconnect best-effort on `close()`.
+
+```typescript kafka.ts
+import { kafkaTransport, type KafkaTransportOptions } from "kkrpc/kafka"
+
+function kafkaTransport(options: KafkaTransportOptions): Transport<RPCMessage>
+```
+
+<ParamField body="localPeerId" type="string" required>
+  Stable identifier for this endpoint. Used to filter self-delivered messages out of the topic.
+</ParamField>
+
+<ParamField body="brokers" type="string[]">
+  Kafka broker addresses. Defaults to `["localhost:9092"]`.
+</ParamField>
+
+<ParamField body="topic" type="string">
+  Topic used to exchange kkrpc bus envelopes. Defaults to `"kkrpc-topic"`.
+</ParamField>
+
+<ParamField body="groupId" type="string">
+  Consumer group id. Defaults to `kkrpc-group-{topic}-{localPeerId}`.
+</ParamField>
+
+<ParamField body="remotePeerId" type="string">
+  Optional target peer id for point-to-point delivery. When absent, messages broadcast to all consumers.
+</ParamField>
+
+<ParamField body="clientId" type="string">
+  KafkaJS client id. Defaults to `kkrpc-client-{localPeerId}`.
+</ParamField>
+
+<ParamField body="fromBeginning" type="boolean">
+  Whether the consumer reads from the beginning on first subscribe. Defaults to `false`.
+</ParamField>
+
+<ParamField body="numPartitions" type="number">
+  Partition count when creating the topic. Defaults to `3`.
+</ParamField>
+
+<ParamField body="replicationFactor" type="number">
+  Replication factor when creating the topic. Defaults to `1`.
+</ParamField>
+
+<ParamField body="ssl" type="boolean | Record<string, unknown>">
+  KafkaJS SSL configuration forwarded to the KafkaJS `Kafka` constructor.
+</ParamField>
+
+<ParamField body="sasl" type="Record<string, unknown>">
+  KafkaJS SASL authentication configuration.
+</ParamField>
+
+<ParamField body="retry" type="Record<string, unknown>">
+  KafkaJS retry configuration.
+</ParamField>
+
+<ParamField body="producerConfig" type="Record<string, unknown>">
+  Extra KafkaJS producer options.
+</ParamField>
+
+<ParamField body="consumerConfig" type="Record<string, unknown>">
+  Extra KafkaJS consumer options.
+</ParamField>
+
+**Capabilities:** `{ objectMode: true, transfer: false, broadcast: !remotePeerId, remoteRefs: !!remotePeerId }`
+
+The transport requires `kafkajs` as a peer dependency. It is lazily imported on first use.
+
+---
+
+## `kkrpc/rabbitmq`
+
+RabbitMQ transports publish bus envelopes to an exchange and consume from an exclusive auto-delete queue. Self-delivery and other-peer messages are acknowledged without delivery to avoid indefinite redelivery.
+
+```typescript rabbitmq.ts
+import { rabbitMqTransport, type RabbitMQTransportOptions } from "kkrpc/rabbitmq"
+
+function rabbitMqTransport(options: RabbitMQTransportOptions): Transport<RPCMessage>
+```
+
+<ParamField body="localPeerId" type="string" required>
+  Stable identifier for this endpoint. Used to filter self-delivered messages.
+</ParamField>
+
+<ParamField body="url" type="string">
+  AMQP connection URL. Defaults to `"amqp://localhost"`.
+</ParamField>
+
+<ParamField body="exchange" type="string">
+  Exchange used to publish and consume kkrpc bus envelopes. Defaults to `"kkrpc-exchange"`.
+</ParamField>
+
+<ParamField body="exchangeType" type='"topic" | "direct" | "fanout"'>
+  RabbitMQ exchange type to assert. Defaults to `"topic"`.
+</ParamField>
+
+<ParamField body="durable" type="boolean">
+  Whether the exchange is durable. Defaults to `true`.
+</ParamField>
+
+<ParamField body="routingKeyPrefix" type="string">
+  Prefix for routing keys. Defaults to `"kkrpc"`. The full routing key becomes `{prefix}.messages`.
+</ParamField>
+
+<ParamField body="remotePeerId" type="string">
+  Optional target peer id for point-to-point delivery. When absent, messages fan out to all bound queues.
+</ParamField>
+
+**Capabilities:** `{ objectMode: true, transfer: false, broadcast: !remotePeerId, remoteRefs: !!remotePeerId }`
+
+Requires `amqplib` as a peer dependency. The transport creates an exclusive, auto-delete, non-durable queue per connection.
+
+---
+
+## `kkrpc/redis-streams`
+
+Redis Streams transports use `XADD` for publishing and either `XREAD` or `XREADGROUP` for consuming. Consumer groups with acknowledgement are enabled by default.
+
+```typescript redis-streams.ts
+import {
+  redisStreamsTransport,
+  type RedisStreamsTransportOptions,
+} from "kkrpc/redis-streams"
+
+function redisStreamsTransport(
+  options: RedisStreamsTransportOptions
+): Transport<RPCMessage>
+```
+
+<ParamField body="localPeerId" type="string" required>
+  Stable identifier for this endpoint. Used to filter self-delivered messages.
+</ParamField>
+
+<ParamField body="url" type="string">
+  Redis connection URL. Defaults to `"redis://localhost:6379"`.
+</ParamField>
+
+<ParamField body="stream" type="string">
+  Stream name used to exchange kkrpc bus envelopes. Defaults to `"kkrpc-stream"`.
+</ParamField>
+
+<ParamField body="consumerGroup" type="string">
+  Consumer group for acknowledged stream consumption. Defaults to `kkrpc-group-{stream}-{localPeerId}`.
+</ParamField>
+
+<ParamField body="consumerName" type="string">
+  Consumer name within the group. Defaults to `consumer-{localPeerId}`.
+</ParamField>
+
+<ParamField body="useConsumerGroup" type="boolean">
+  Set `false` to use plain `XREAD` without acknowledgement. Defaults to `true`.
+</ParamField>
+
+<ParamField body="blockTimeout" type="number">
+  Blocking read timeout in milliseconds. Defaults to `5000`.
+</ParamField>
+
+<ParamField body="maxLen" type="number">
+  Approximate maximum stream length trimmed while publishing. Not applied when absent.
+</ParamField>
+
+<ParamField body="remotePeerId" type="string">
+  Optional target peer id for point-to-point delivery.
+</ParamField>
+
+**Capabilities:** `{ objectMode: true, transfer: false, broadcast: !remotePeerId, remoteRefs: !!remotePeerId }`
+
+Requires `ioredis` as a peer dependency. Two `ioredis` connections are opened per transport — one for publishing and one for the blocking read loop.
+
+---
+
+## `kkrpc/nats`
+
+NATS transports publish bus envelopes on a subject and consume them in an async subscription loop. Optional queue groups enable load-balanced delivery across multiple subscribers.
+
+```typescript nats.ts
+import { natsTransport, type NatsTransportOptions } from "kkrpc/nats"
+
+function natsTransport(options: NatsTransportOptions): Transport<RPCMessage>
+```
+
+<ParamField body="localPeerId" type="string" required>
+  Stable identifier for this endpoint. Used to filter self-delivered messages.
+</ParamField>
+
+<ParamField body="servers" type="string | string[]">
+  NATS server URL or URLs. Defaults to `"nats://localhost:4222"`.
+</ParamField>
+
+<ParamField body="subject" type="string">
+  Subject used to exchange kkrpc bus envelopes. Defaults to `"kkrpc.messages"`.
+</ParamField>
+
+<ParamField body="queueGroup" type="string">
+  Optional queue group for load-balanced subscription delivery.
+</ParamField>
+
+<ParamField body="timeout" type="number">
+  NATS connection timeout in milliseconds. Defaults to `10000`.
+</ParamField>
+
+<ParamField body="remotePeerId" type="string">
+  Optional target peer id for point-to-point delivery.
+</ParamField>
+
+**Capabilities:** `{ objectMode: true, transfer: false, broadcast: !remotePeerId, remoteRefs: !!remotePeerId }`
+
+Requires `@nats-io/transport-node` as a peer dependency (lazily imported on first use). The subscription loop stops when `close()` is called.
+
+---
+
+## `kkrpc/transport`
+
+The low-level composition primitive for building transports from a `Platform` and a `Codec`. Most callers use the pre-built factory functions above; use `createTransport` only when you need custom wire encoding or a platform not covered by the existing factories.
+
+```typescript transport.ts
+import { createTransport } from "kkrpc/transport"
+import type { Platform, Codec, Transport, TransportCapabilities } from "kkrpc/transport"
+
+function createTransport<TMessage, TWire>(options: {
+  platform: Platform<TWire>
+  codec: Codec<TMessage, TWire>
+  capabilities?: TransportCapabilities
+  onInvalidFrame?: (wire: TWire, error: unknown) => void
+}): Transport<TMessage>
+```
+
+Transfer support is enabled only when both `platform.capabilities.transfer` and `codec.capabilities.transfer` are `true`. Capability overrides in the options object can only downgrade transfer capability, not upgrade an unsafe pair.

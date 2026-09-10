@@ -1,0 +1,479 @@
+---
+title: "Migrating to kkRPC 1.0 Native Transports"
+sidebarTitle: "Migration 1.0"
+description: "Step-by-step guide for moving from the classic IoInterface adapter model to the native Transport<RPCMessage> architecture introduced in kkRPC 1.0."
+---
+
+kkRPC 1.0 replaced the original `IoInterface`/`IoMessage` adapter model with a leaner, native `Transport<RPCMessage>` architecture. The public API surface shrank considerably — a handful of legacy entries were removed, and every runtime transport moved to its own subpath export. If you are upgrading from a 0.x or pre-release 1.0 codebase, this guide covers every breaking change and shows the exact import changes you need to make.
+
+<Warning>
+  This migration contains **breaking changes**. The removed exports (`IoInterface`, `IoMessage`, `RPCValidators`, `RPCInterceptor`, `classic-compat`, `next/io`, `browser-lite`, `browser-mini`, `electron-ipc`) no longer exist in the package. TypeScript will give you a compile error if you reference them — use that as a checklist to track your migration progress.
+</Warning>
+
+## What Changed
+
+### Removed: `IoInterface` and `IoMessage`
+
+The classic adapter model required implementing an `IoInterface` with `read()` and `write()` methods and wrapping it before passing it to `RPCChannel`. This indirection is gone. Transports are now message-level objects that expose `send()` and `subscribe()` directly.
+
+```typescript
+// Before (0.x) — IoInterface adapter
+class MyTransport implements IoInterface {
+  async read(): Promise<string> { /* ... */ }
+  async write(data: string): Promise<void> { /* ... */ }
+}
+
+const channel = new RPCChannel(new MyTransport(), { expose: api })
+```
+
+```typescript
+// After (1.0) — native Transport<RPCMessage>
+import { createTransport } from "kkrpc/transport"
+
+const transport = createTransport({ platform: myPlatform, codec: myCodec })
+const channel = new RPCChannel(transport, { expose: api })
+```
+
+### Removed: `RPCValidators` and `RPCInterceptor`
+
+Validation and middleware were previously configured as top-level channel options (`validators`, `interceptors`). They are now plugins supplied through the `plugins` array. The types `RPCValidators` and `RPCInterceptor` no longer exist.
+
+### Removed Entry Points
+
+| Removed entry | Why removed |
+| ------------- | ----------- |
+| `kkrpc/classic-compat` | Legacy shim for `IoInterface`; no longer needed |
+| `kkrpc/next/io` | Temporary pre-release entry during the transition |
+| `kkrpc/browser-lite` | Merged into the default slim `kkrpc` entry |
+| `kkrpc/browser-mini` | Merged into the default slim `kkrpc` entry |
+| `kkrpc/electron-ipc` | Replaced by `kkrpc/electron` |
+
+### New `Transport<RPCMessage>` Architecture
+
+The stable `Transport<T>` interface is three methods:
+
+```typescript
+interface Transport<TMessage> {
+  capabilities?: TransportCapabilities
+  send(message: TMessage, transfers?: Transferable[]): void | Promise<void>
+  subscribe(listener: (message: TMessage) => void): () => void
+  close?(): void
+  onClose?(listener: (reason?: Error) => void): () => void
+}
+```
+
+All first-party transports (`workerTransport`, `webSocketTransport`, `nodeStdioTransport`, etc.) return `Transport<RPCMessage>` directly. You never need to implement this interface yourself unless you are writing a custom transport — use the factory functions from the subpath exports.
+
+## Import Migration Table
+
+Use this table to find the new import for every old one. Every transport factory now lives behind a subpath export so the main `kkrpc` entry stays browser-safe and tree-shakeable.
+
+| Old import (0.x / pre-1.0) | New import (1.0+) |
+| --------------------------- | ----------------- |
+| `import { RPCChannel, wrap, expose } from "kkrpc"` | `import { RPCChannel, wrap, expose } from "kkrpc"` ✅ unchanged |
+| `import { IoInterface, IoMessage } from "kkrpc"` | **Removed** — use factory functions instead |
+| `import { RPCValidators } from "kkrpc"` | `import { validationPlugin } from "kkrpc/validation"` |
+| `import { RPCInterceptor } from "kkrpc"` | `import { middlewarePlugin, type RPCInterceptor } from "kkrpc/middleware"` |
+| `import { ... } from "kkrpc/classic-compat"` | **Removed** — no replacement |
+| `import { ... } from "kkrpc/next/io"` | **Removed** — use the stable entry |
+| `import { ... } from "kkrpc/browser-lite"` | `import { ... } from "kkrpc"` |
+| `import { ... } from "kkrpc/browser-mini"` | `import { ... } from "kkrpc"` |
+| `import { ... } from "kkrpc/electron-ipc"` | `import { electronIpcTransport, electronUtilityProcessTransport } from "kkrpc/electron"` |
+| Worker transport (inline / custom) | `import { workerTransport, workerSelfTransport } from "kkrpc/worker"` |
+| WebSocket transport (inline / custom) | `import { webSocketTransport, webSocketClientTransport } from "kkrpc/ws"` |
+| stdio transport (inline / custom) | `import { nodeStdioTransport, stdioJsonTransport } from "kkrpc/stdio"` |
+| HTTP transport (inline / custom) | `import { createHttpHandler, httpClientTransport } from "kkrpc/http"` |
+| iframe transport (inline / custom) | `import { iframeTransport, iframeSelfTransport } from "kkrpc/iframe"` |
+
+## Before/After Code Examples
+
+### Worker Transport
+
+<CodeGroup>
+
+```typescript Before (0.x)
+// main.ts — old IoInterface worker wrapper
+import { RPCChannel } from "kkrpc"
+import type { WorkerAPI } from "./worker"
+
+const worker = new Worker(new URL("./worker.ts", import.meta.url), { type: "module" })
+
+// Manual IoInterface implementation
+const transport = {
+  async read() { /* listen for worker messages */ },
+  async write(data: string) { worker.postMessage(data) }
+}
+
+const channel = new RPCChannel<{}, WorkerAPI>(transport)
+const api = channel.getAPI()
+await api.ping()
+```
+
+```typescript After (1.0)
+// main.ts — native workerTransport
+import { wrap } from "kkrpc"
+import { workerTransport } from "kkrpc/worker"
+import type { WorkerAPI } from "./worker"
+
+const worker = new Worker(new URL("./worker.ts", import.meta.url), { type: "module" })
+const api = wrap<WorkerAPI>(workerTransport(worker))
+
+await api.ping()
+```
+
+</CodeGroup>
+
+<CodeGroup>
+
+```typescript Before (0.x) — worker.ts
+import { RPCChannel } from "kkrpc"
+
+const api = { async ping() { return "pong" } }
+export type WorkerAPI = typeof api
+
+// Manual self transport from globalThis message events
+const transport = {
+  async read() { /* ... */ },
+  async write(data: string) { self.postMessage(data) }
+}
+
+const channel = new RPCChannel<WorkerAPI, {}>(transport, { expose: api })
+```
+
+```typescript After (1.0) — worker.ts
+import { expose } from "kkrpc"
+import { workerSelfTransport } from "kkrpc/worker"
+
+const api = { async ping() { return "pong" } }
+export type WorkerAPI = typeof api
+
+expose(api, workerSelfTransport())
+```
+
+</CodeGroup>
+
+### stdio Transport
+
+<CodeGroup>
+
+```typescript Before (0.x) — child.ts
+import { RPCChannel, IoInterface } from "kkrpc"
+
+class StdioTransport implements IoInterface {
+  private buffer = ""
+
+  async read(): Promise<string> {
+    // custom line-buffering logic
+    return new Promise((resolve) => {
+      process.stdin.on("data", (chunk) => {
+        this.buffer += chunk
+        const idx = this.buffer.indexOf("\n")
+        if (idx >= 0) {
+          resolve(this.buffer.slice(0, idx))
+          this.buffer = this.buffer.slice(idx + 1)
+        }
+      })
+    })
+  }
+
+  async write(data: string): Promise<void> {
+    process.stdout.write(data + "\n")
+  }
+}
+
+const channel = new RPCChannel<typeof api, {}>(new StdioTransport(), { expose: api })
+```
+
+```typescript After (1.0) — child.ts
+import { expose } from "kkrpc"
+import { nodeStdioTransport } from "kkrpc/stdio"
+
+const api = {
+  async version() { return process.version }
+}
+
+export type ChildAPI = typeof api
+
+// One-liner: nodeStdioTransport() binds process.stdin and process.stdout
+expose(api, nodeStdioTransport())
+```
+
+</CodeGroup>
+
+<CodeGroup>
+
+```typescript Before (0.x) — parent.ts
+import { spawn } from "node:child_process"
+import { RPCChannel } from "kkrpc"
+import type { ChildAPI } from "./child"
+
+const child = spawn("node", ["child.js"])
+
+// Manual stdio adapter wiring stdin/stdout
+const transport = { /* custom IoInterface */ }
+const channel = new RPCChannel<{}, ChildAPI>(transport)
+const api = channel.getAPI()
+```
+
+```typescript After (1.0) — parent.ts
+import { spawn } from "node:child_process"
+import { wrap } from "kkrpc"
+import { nodeStdioTransport } from "kkrpc/stdio"
+import type { ChildAPI } from "./child"
+
+const child = spawn("node", ["child.js"])
+
+const api = wrap<ChildAPI>(nodeStdioTransport({
+  readable: child.stdout,
+  writable: child.stdin
+}))
+
+console.log(await api.version())
+```
+
+</CodeGroup>
+
+### WebSocket Transport
+
+<CodeGroup>
+
+```typescript Before (0.x) — server.ts
+import { RPCChannel } from "kkrpc"
+import { WebSocketServer } from "ws"
+
+const wss = new WebSocketServer({ port: 3000 })
+
+wss.on("connection", (socket) => {
+  // Custom IoInterface wrapping ws socket events
+  const transport = {
+    async read() { /* listen to socket.on("message") */ },
+    async write(data: string) { socket.send(data) }
+  }
+  const channel = new RPCChannel<typeof api, {}>(transport, { expose: api })
+})
+```
+
+```typescript After (1.0) — server.ts
+import { expose } from "kkrpc"
+import { webSocketTransport } from "kkrpc/ws"
+import { WebSocketServer } from "ws"
+
+const wss = new WebSocketServer({ port: 3000 })
+
+wss.on("connection", (socket) => {
+  expose(api, webSocketTransport(socket))
+})
+```
+
+</CodeGroup>
+
+<CodeGroup>
+
+```typescript Before (0.x) — client.ts
+import { RPCChannel } from "kkrpc"
+import type { API } from "./server"
+
+const socket = new WebSocket("ws://localhost:3000")
+
+// Manual IoInterface around browser WebSocket
+const transport = {
+  async read() { /* ... */ },
+  async write(data: string) { socket.send(data) }
+}
+
+const channel = new RPCChannel<{}, API>(transport)
+const api = channel.getAPI()
+```
+
+```typescript After (1.0) — client.ts
+import { wrap } from "kkrpc"
+import { webSocketClientTransport } from "kkrpc/ws"
+import type { API } from "./server"
+
+const api = wrap<API>(webSocketClientTransport({ url: "ws://localhost:3000" }))
+
+console.log(await api.greet("World"))
+```
+
+</CodeGroup>
+
+### Validation
+
+<CodeGroup>
+
+```typescript Before (0.x)
+import { expose, RPCChannel } from "kkrpc"
+import { z } from "zod"
+
+// Old: validators as a top-level channel option
+const channel = new RPCChannel(transport, {
+  expose: api,
+  validators: {
+    add: {
+      input: z.tuple([z.number(), z.number()]),
+      output: z.number()
+    }
+  }
+})
+```
+
+```typescript After (1.0)
+import { expose } from "kkrpc"
+import { defineAPI, defineMethod, extractValidators, validationPlugin } from "kkrpc/validation"
+import { z } from "zod"
+
+// New: schema-first with defineMethod, plugin-based validation
+const api = defineAPI({
+  add: defineMethod(
+    { input: z.tuple([z.number(), z.number()]), output: z.number() },
+    async (a, b) => a + b
+  )
+})
+
+export type API = typeof api
+
+expose(api, transport, {
+  plugins: [validationPlugin(extractValidators(api))]
+})
+```
+
+</CodeGroup>
+
+You can also keep an existing undecorated API and supply a `ValidatorMap` separately:
+
+```typescript after-validator-map.ts
+import { expose } from "kkrpc"
+import { validationPlugin, type ValidatorMap } from "kkrpc/validation"
+import { z } from "zod"
+
+interface MathAPI {
+  add(a: number, b: number): Promise<number>
+}
+
+const validators: ValidatorMap<MathAPI> = {
+  add: {
+    input: z.tuple([z.number(), z.number()]),
+    output: z.number()
+  }
+}
+
+expose(api, transport, {
+  plugins: [validationPlugin(validators)]
+})
+```
+
+### Middleware
+
+<CodeGroup>
+
+```typescript Before (0.x)
+import { RPCChannel, RPCInterceptor } from "kkrpc"
+
+// Old: RPCInterceptor type + interceptors channel option
+const logger: RPCInterceptor = async (ctx, next) => {
+  console.log("rpc:start", ctx.method)
+  const result = await next()
+  console.log("rpc:end", ctx.method)
+  return result
+}
+
+const channel = new RPCChannel(transport, {
+  expose: api,
+  interceptors: [logger]
+})
+```
+
+```typescript After (1.0)
+import { expose } from "kkrpc"
+import { middlewarePlugin, type RPCInterceptor } from "kkrpc/middleware"
+
+// New: RPCInterceptor imported from kkrpc/middleware, plugin-based
+const logger: RPCInterceptor = async (ctx, next) => {
+  console.log("rpc:start", ctx.method, ctx.args)
+  const result = await next()
+  console.log("rpc:end", ctx.method)
+  return result
+}
+
+expose(api, transport, {
+  plugins: [middlewarePlugin([logger])]
+})
+```
+
+</CodeGroup>
+
+### Electron IPC
+
+<CodeGroup>
+
+```typescript Before (0.x)
+import { expose } from "kkrpc"
+import { electronIpcTransport } from "kkrpc/electron-ipc"
+
+expose(api, electronIpcTransport())
+```
+
+```typescript After (1.0)
+import { expose } from "kkrpc"
+import { electronIpcTransport } from "kkrpc/electron"
+
+expose(api, electronIpcTransport())
+```
+
+</CodeGroup>
+
+<Note>
+  The entry point changed from `kkrpc/electron-ipc` to `kkrpc/electron`. The `electronUtilityProcessTransport()` factory for Electron utility processes is also exported from the same new entry.
+</Note>
+
+## `RPCChannel` vs `wrap` / `expose`
+
+The old pattern always used `new RPCChannel(transport, options).getAPI()`. The new helpers are the preferred approach for most use cases:
+
+| Use case | Recommended API |
+| -------- | --------------- |
+| Server exposing an API, no remote calls needed | `expose(api, transport)` |
+| Client calling a remote API, not exposing anything | `wrap<RemoteAPI>(transport)` |
+| Both sides expose APIs (bidirectional) | `new RPCChannel<LocalAPI, RemoteAPI>(transport, { expose: api })` |
+| Need explicit channel lifecycle control | `new RPCChannel(transport, ...)` + `channel.destroy()` |
+
+```typescript rpc-channel-both-sides.ts
+import { RPCChannel } from "kkrpc"
+import { webSocketTransport } from "kkrpc/ws"
+
+type LocalAPI  = { ping(): Promise<string> }
+type RemoteAPI = { greet(name: string): Promise<string> }
+
+const channel = new RPCChannel<LocalAPI, RemoteAPI>(
+  webSocketTransport(socket),
+  { expose: { async ping() { return "pong" } } }
+)
+
+const remote = channel.getAPI()
+console.log(await remote.greet("World"))
+
+channel.destroy()
+```
+
+## Checklist
+
+<Steps>
+  <Step title="Remove legacy entries">
+    Delete imports from `kkrpc/classic-compat`, `kkrpc/next/io`, `kkrpc/browser-lite`, `kkrpc/browser-mini`, and `kkrpc/electron-ipc`. TypeScript errors will guide you to each one.
+  </Step>
+  <Step title="Replace IoInterface implementations">
+    Delete any class that implements `IoInterface` or `IoMessage`. Replace with the appropriate factory from `kkrpc/worker`, `kkrpc/stdio`, `kkrpc/ws`, `kkrpc/http`, `kkrpc/iframe`, or `kkrpc/electron`.
+  </Step>
+  <Step title="Migrate validation">
+    Remove `validators` from `RPCChannel` options. Add `validationPlugin(validators)` to the `plugins` array. Update the import to `kkrpc/validation`. Replace `RPCValidators` type references with `ValidatorMap`.
+  </Step>
+  <Step title="Migrate middleware">
+    Remove `interceptors` from `RPCChannel` options. Add `middlewarePlugin([...interceptors])` to the `plugins` array. Update the `RPCInterceptor` type import to `kkrpc/middleware`.
+  </Step>
+  <Step title="Switch to wrap / expose helpers">
+    For one-sided channels, replace `new RPCChannel(...).getAPI()` with `wrap<API>(transport)` and `expose(api, transport)`. Bidirectional channels can keep `RPCChannel` directly.
+  </Step>
+  <Step title="Verify peer dependencies">
+    Transports with optional peer dependencies (`ws`, `hono`, `elysia`, `socket.io`, `amqplib`, `kafkajs`, `ioredis`, `@nats-io/transport-node`) are not bundled. Install only the ones your code imports.
+  </Step>
+</Steps>

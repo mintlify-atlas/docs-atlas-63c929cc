@@ -1,0 +1,412 @@
+---
+title: "RPCChannel: Bidirectional RPC Channel Class"
+sidebarTitle: "RPCChannel"
+description: "Full reference for RPCChannel: constructor, RPCChannelOptions fields, getAPI, destroy lifecycle, plugin hook types, and when to prefer it over wrap/expose."
+---
+
+`RPCChannel` is the central class that owns one transport, exposes an optional local API, and
+creates a typed proxy for the remote API. The convenience functions `wrap()` and `expose()` are
+thin wrappers around it — use `RPCChannel` directly when you need access to both sides of a
+bidirectional connection in the same scope, or when you want to manage the channel's lifetime
+explicitly without the proxy-keyed disposal map.
+
+## Class Signature
+
+```typescript
+class RPCChannel<
+  LocalAPI extends object = object,
+  RemoteAPI extends object = object
+>
+```
+
+Both type parameters default to `object` so the class is usable without generics, but providing
+concrete interfaces unlocks full type inference on `getAPI()`.
+
+## Constructor
+
+```typescript
+constructor(
+  transport: Transport<RPCMessage>,
+  options?: RPCChannelOptions<LocalAPI>
+)
+```
+
+Creates the channel and subscribes to the transport immediately. Incoming messages start being
+dispatched as soon as the transport delivers them, so set up any listeners before `await`-ing
+results.
+
+```typescript bidirectional.ts
+import { RPCChannel } from "kkrpc"
+import { workerTransport } from "kkrpc/worker"
+
+const worker = new Worker(new URL("./worker.ts", import.meta.url).href, { type: "module" })
+
+// Expose a local API *and* call the worker's API from one channel:
+const channel = new RPCChannel<LocalAPI, WorkerAPI>(workerTransport(worker), {
+  expose: localAPI
+})
+
+const remote = channel.getAPI()
+const result = await remote.math.grade2.multiply(2, 3)
+
+channel.destroy()
+```
+
+<ParamField path="transport" type="Transport<RPCMessage>" required>
+  The message-level transport. Obtain one from a subpath export such as `kkrpc/worker`,
+  `kkrpc/ws`, or `kkrpc/stdio`. The channel unsubscribes from the transport on `destroy()`.
+</ParamField>
+
+<ParamField path="options" type="RPCChannelOptions<LocalAPI>">
+  Optional configuration object. See [`RPCChannelOptions`](#rpchanneloptions) below.
+</ParamField>
+
+---
+
+## `RPCChannelOptions`
+
+```typescript
+interface RPCChannelOptions<LocalAPI extends object = object> {
+  expose?: LocalAPI
+  timeout?: number
+  enableTransfer?: boolean
+  plugins?: RPCPlugin[]
+  getMetadata?: () => RPCMessageMetadata | undefined
+  onClose?: (reason?: Error) => void
+  onUncaughtError?: (error: Error, context: { kind: "set" | "callback"; path?: string[] }) => void
+}
+```
+
+<ParamField path="expose" type="LocalAPI">
+  Local API object to make callable from the remote side. Omit this for a pure-client channel that
+  only calls the remote API without serving one of its own. Nested objects are resolved by property
+  path, e.g. `["math", "add"]`.
+</ParamField>
+
+<ParamField path="timeout" type="number" default="30000">
+  Default request timeout in milliseconds. Applied to every outgoing call unless overridden by
+  `withCallOptions`. Set to `0` to disable timeouts entirely. Timed-out requests reject with an
+  `RPCTimeoutError` (name: `"RPCTimeoutError"`).
+</ParamField>
+
+<ParamField path="enableTransfer" type="boolean" default="true">
+  Controls whether `transfer()` descriptors are forwarded to the platform. Set to `false` to
+  disable transferable forwarding even when the transport reports `capabilities.transfer === true`.
+  Useful for debugging or when the transport's transfer support is unreliable.
+</ParamField>
+
+<ParamField path="plugins" type="RPCPlugin[]">
+  Array of plugin objects that run while handling incoming requests. Plugins can inspect and mutate
+  the request context, wrap handler execution, transform the response, or replace errors. See the
+  [Plugins reference](/api/core#plugin-types) for the full hook surface.
+</ParamField>
+
+<ParamField path="getMetadata" type="() => RPCMessageMetadata | undefined">
+  Called once per outgoing request to produce optional protocol-level metadata such as W3C trace
+  context headers or a request id. The returned object is attached to the `RPCRequest` message and
+  forwarded to plugin hooks on the receiving side as `ctx.meta`.
+
+  ```typescript tracing.ts
+  const channel = new RPCChannel(transport, {
+    getMetadata: () => ({
+      traceparent: tracer.currentSpan()?.traceparent(),
+      requestId: crypto.randomUUID()
+    })
+  })
+  ```
+</ParamField>
+
+<ParamField path="onClose" type="(reason?: Error) => void">
+  Invoked at most once when the transport reports the connection has permanently closed — either a
+  clean remote close (`reason` is `undefined`) or an abnormal termination (`reason` is an `Error`).
+  Called after all pending requests have been rejected with `RPCTransportClosedError`. Only fires
+  when the transport implements `onClose`; silent otherwise.
+
+  <Note>
+    The channel is **not** destroyed when `onClose` fires. Create a new transport and channel to
+    reconnect.
+  </Note>
+</ParamField>
+
+<ParamField path="onUncaughtError" type="(error: Error, context) => void">
+  Diagnostic hook for errors from fire-and-forget code paths that would otherwise be silently
+  swallowed:
+  - `kind: "set"` — a remote property setter (`remote.x = value`) that fails on the remote side.
+  - `kind: "callback"` — a local callback argument that throws or rejects when invoked.
+
+  `path` carries the dot-path segments for `"set"` errors. Purely observational; errors are still
+  dropped on the wire paths regardless.
+</ParamField>
+
+---
+
+## Methods
+
+### `getAPI()`
+
+```typescript
+getAPI(): RemoteAPI
+```
+
+Returns a typed `Proxy` that translates property accesses, function calls, setter assignments, and
+`new` expressions into protocol messages sent over the transport.
+
+The proxy tree is lazily constructed: each property access returns a new child proxy that remembers
+the extended path. Only when the proxy is awaited or called does a network message get sent.
+
+```typescript get-api.ts
+const channel = new RPCChannel<object, RemoteAPI>(transport)
+const remote = channel.getAPI()
+
+// Function call → RPCRequest { op: "call", p: ["math", "add"], a: [3, 4] }
+const sum = await remote.math.add(3, 4)
+
+// Property get → RPCRequest { op: "get", p: ["version"] }
+const ver = await remote.version
+
+// Constructor call → RPCRequest { op: "new", p: ["EventEmitter"] }
+const emitter = await new (remote as any).EventEmitter()
+```
+
+<Tip>
+  When both a local and remote API are needed on the same bidirectional connection, keep the
+  `RPCChannel` instance and call `getAPI()` rather than using both `wrap()` and `expose()`
+  separately — that would create two channels and two transport subscriptions.
+</Tip>
+
+---
+
+### `destroy()`
+
+```typescript
+destroy(): void
+```
+
+Tears down the channel fully:
+
+1. Unsubscribes from the transport's message stream.
+2. Unregisters the `onClose` listener if one was registered.
+3. Rejects all pending requests with `Error("RPC channel destroyed")`.
+4. Clears the callback registry and pending callback-release queue.
+5. Calls `transport.close?.()`.
+
+Calling `destroy()` multiple times is safe — subsequent calls are no-ops.
+
+```typescript lifecycle.ts
+const channel = new RPCChannel<LocalAPI, RemoteAPI>(transport, { expose: localAPI })
+const remote = channel.getAPI()
+
+try {
+  await remote.longRunning()
+} finally {
+  channel.destroy()
+}
+```
+
+---
+
+## Using `CALL_OPTIONS` and `withCallOptions`
+
+`withCallOptions(proxy, options)` derives a new proxy from an existing remote proxy so individual
+calls can override `timeout` or attach an `AbortSignal` without changing the channel default. It
+works on any proxy produced by `getAPI()` or `wrap()`.
+
+```typescript per-call-options.ts
+import { RPCChannel, withCallOptions } from "kkrpc"
+import { workerTransport } from "kkrpc/worker"
+
+const channel = new RPCChannel<object, RemoteAPI>(workerTransport(worker), {
+  timeout: 30_000  // 30 s channel default
+})
+const remote = channel.getAPI()
+
+// Override for one logical group of calls:
+const fast = withCallOptions(remote, { timeout: 500 })
+const result = await fast.quickLookup("key")   // rejects after 500 ms
+
+// Cancelable batch:
+const ac = new AbortController()
+const cancelable = withCallOptions(remote, { signal: ac.signal })
+Promise.all([
+  cancelable.stepOne(),
+  cancelable.stepTwo()
+]).catch(() => {})
+ac.abort()   // both calls reject immediately
+```
+
+---
+
+## `wrap()` vs `expose()` vs `RPCChannel`
+
+<Tabs>
+  <Tab title="wrap()">
+    Best for client-only flows where you only call the remote side and never serve one yourself.
+    The created channel is tracked internally so `dispose(proxy)` can clean it up.
+
+    ```typescript client.ts
+    import { wrap, dispose } from "kkrpc"
+    import { webSocketClientTransport } from "kkrpc/ws"
+
+    const api = wrap<RemoteAPI>(
+      webSocketClientTransport({ url: "ws://localhost:3000" })
+    )
+    const result = await api.greet("world")
+    dispose(api)
+    ```
+  </Tab>
+  <Tab title="expose()">
+    Best for server-only flows where you serve an API and optionally call back into the peer via
+    `controller.channel.getAPI()`.
+
+    ```typescript server.ts
+    import { expose } from "kkrpc"
+    import { nodeStdioTransport } from "kkrpc/stdio"
+
+    const controller = expose(
+      { greet: (name: string) => `hello ${name}` },
+      nodeStdioTransport()
+    )
+
+    // Also call back into the caller if the connection is bidirectional:
+    const remote = controller.channel.getAPI<CallerAPI>()
+    ```
+  </Tab>
+  <Tab title="RPCChannel">
+    Best when you need both sides in one scope, want explicit `destroy()` control, or are building
+    a higher-level abstraction on top of kkrpc.
+
+    ```typescript bidirectional.ts
+    import { RPCChannel } from "kkrpc"
+    import { workerTransport } from "kkrpc/worker"
+
+    const worker = new Worker("./worker.js")
+    const channel = new RPCChannel<LocalAPI, WorkerAPI>(
+      workerTransport(worker),
+      { expose: localAPI, timeout: 10_000 }
+    )
+    const remote = channel.getAPI()
+    const output = await remote.process(data)
+    channel.destroy()
+    worker.terminate()
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Plugin Types
+
+These interfaces describe the hook surface available to plugins passed in `RPCChannelOptions.plugins`.
+
+### `RPCPlugin`
+
+```typescript
+interface RPCPlugin {
+  name?: string
+  onRequest?(ctx: RPCRequestContext): void | Promise<void>
+  wrapHandler?(ctx: RPCHandlerContext, next: () => Promise<unknown>): Promise<unknown>
+  onResponse?(ctx: RPCResponseContext): void | Promise<void>
+  onError?(ctx: RPCErrorContext): void | Promise<void>
+}
+```
+
+<ParamField path="name" type="string">
+  Optional plugin name used in diagnostic messages.
+</ParamField>
+
+<ParamField path="onRequest" type="(ctx: RPCRequestContext) => void | Promise<void>">
+  Runs before the local handler is invoked. Use to authenticate, validate, or enrich the request
+  context. Throwing here rejects the request with the thrown error.
+</ParamField>
+
+<ParamField path="wrapHandler" type="(ctx: RPCHandlerContext, next: () => Promise<unknown>) => Promise<unknown>">
+  Wraps local handler execution as an onion middleware chain. Call `next()` to continue; return or
+  replace the result; throw to propagate an error.
+</ParamField>
+
+<ParamField path="onResponse" type="(ctx: RPCResponseContext) => void | Promise<void>">
+  Runs after the handler returns successfully, before the response is serialized. Mutate
+  `ctx.result` to transform the response value.
+</ParamField>
+
+<ParamField path="onError" type="(ctx: RPCErrorContext) => void | Promise<void>">
+  Runs after the handler or a previous hook throws. Mutate `ctx.error` to replace the error, or
+  swallow it by assigning `undefined` (the framework rethrows `ctx.error` after all hooks run).
+</ParamField>
+
+---
+
+### `RPCRequestContext`
+
+```typescript
+interface RPCRequestContext {
+  id: string
+  operation: RPCOperation
+  path: string[]
+  method: string
+  args: unknown[]
+  value?: unknown
+  meta?: RPCMessageMetadata
+  state: Record<string, unknown>
+}
+```
+
+<ParamField path="id" type="string">Request id that matches the eventual `RPCResponse`.</ParamField>
+<ParamField path="operation" type="RPCOperation">Operation being handled: `"call"`, `"get"`, `"set"`, or `"new"`.</ParamField>
+<ParamField path="path" type="string[]">Property path on the exposed API, e.g. `["math", "add"]`.</ParamField>
+<ParamField path="method" type="string">Dot-joined path string, useful for logging and validation lookup.</ParamField>
+<ParamField path="args" type="unknown[]">Decoded request arguments.</ParamField>
+<ParamField path="value" type="unknown">Decoded setter value; present only for `"set"` operations.</ParamField>
+<ParamField path="meta" type="RPCMessageMetadata">Protocol-level metadata from the incoming request.</ParamField>
+<ParamField path="state" type="Record<string, unknown>">Mutable per-request bag shared across all plugin hooks for coordination.</ParamField>
+
+---
+
+### `RPCHandlerContext`
+
+```typescript
+interface RPCHandlerContext extends RPCRequestContext {
+  localAPI: object
+}
+```
+
+Extends `RPCRequestContext` with `localAPI` — the object passed to `expose` or `RPCChannelOptions.expose`.
+
+---
+
+### `RPCResponseContext`
+
+```typescript
+interface RPCResponseContext {
+  id: string
+  operation: RPCOperation
+  path: string[]
+  method: string
+  result: unknown
+  meta?: RPCMessageMetadata
+  state: Record<string, unknown>
+}
+```
+
+<ParamField path="result" type="unknown">Mutable result value that will be sent to the caller. Plugins may replace it.</ParamField>
+
+---
+
+### `RPCErrorContext`
+
+```typescript
+interface RPCErrorContext {
+  id: string
+  operation: RPCOperation
+  path: string[]
+  method: string
+  error: unknown
+  meta?: RPCMessageMetadata
+  state: Record<string, unknown>
+}
+```
+
+<ParamField path="error" type="unknown">
+  Mutable error value. Assign a new `Error` to replace it; the framework rethrows `ctx.error` after
+  all `onError` hooks run, so the new value is what gets serialized and sent.
+</ParamField>

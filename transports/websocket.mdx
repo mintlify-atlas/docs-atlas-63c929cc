@@ -1,0 +1,271 @@
+---
+title: "WebSocket Transport for Bidirectional RPC over TCP"
+sidebarTitle: "WebSocket"
+description: "Establish persistent full-duplex RPC channels over WebSocket using webSocketTransport, with adapters for raw ws, Hono, and Elysia servers."
+---
+
+WebSocket transport provides a persistent, full-duplex channel that outlives individual requests. Because the connection stays open, both the client and the server can initiate calls, pass callback arguments, and stream async iterables — none of which are possible over plain HTTP. Messages travel as JSON strings, so transferable objects are not supported by this transport.
+
+There are four factory functions spread across two subpath entries. Use `webSocketTransport` or `webSocketClientTransport` from `kkrpc/ws` for raw WebSocket objects. Use `honoWebSocketTransport` from `kkrpc/ws/hono` or `elysiaWebSocketTransport` from `kkrpc/ws/elysia` when your server uses those frameworks, which route lifecycle events through callbacks rather than exposing a standard socket object.
+
+## Transport capabilities
+
+| Capability | Supported |
+| --- | --- |
+| Bidirectional calls | ✅ |
+| Callback arguments | ✅ |
+| Transferable objects | ❌ |
+| Async iterable streaming | ✅ |
+
+## API
+
+<ParamField path="webSocketTransport" type="function">
+  Wraps any accepted or pre-created `WebSocketLike` object as a kkrpc transport. Works with the native browser `WebSocket`, Node.js `ws` sockets, Bun `ServerWebSocket`, and Deno `WebSocket`. Sends before the socket opens are queued and flushed on `open`.
+
+  ```typescript
+  import { webSocketTransport } from "kkrpc/ws"
+  webSocketTransport(socket: WebSocketLike): Transport<RPCMessage>
+  ```
+</ParamField>
+
+<ParamField path="webSocketClientTransport" type="function">
+  Constructs a new `WebSocket` from a URL and wraps it as a transport. Useful when you control only the client side. Supports an optional `protocols` field.
+
+  ```typescript
+  import { webSocketClientTransport } from "kkrpc/ws"
+  webSocketClientTransport(options: { url: string; protocols?: string | string[] }): Transport<RPCMessage>
+  ```
+</ParamField>
+
+<ParamField path="honoWebSocketTransport" type="function">
+  Wraps a Hono `WSContext`-like object in a feedable transport. Because Hono delivers messages through framework callbacks, you must pass incoming messages to `transport.feed(event.data)` manually — or use the higher-level `createHonoWebSocketHandler` helper which wires everything automatically.
+
+  ```typescript
+  import { honoWebSocketTransport, createHonoWebSocketHandler } from "kkrpc/ws/hono"
+  honoWebSocketTransport(ws: HonoWebSocketContextLike): FeedableHonoWebSocketTransport
+  createHonoWebSocketHandler<LocalAPI>(options: { expose: LocalAPI; timeout?: number }): HonoWebSocketHandlerEvents
+  ```
+</ParamField>
+
+<ParamField path="elysiaWebSocketTransport" type="function">
+  Wraps an Elysia socket-like object. Same feedable pattern as Hono: use `createElysiaWebSocketHandler` to get lifecycle handlers that Elysia can consume directly.
+
+  ```typescript
+  import { elysiaWebSocketTransport, createElysiaWebSocketHandler } from "kkrpc/ws/elysia"
+  elysiaWebSocketTransport(ws: ElysiaSocketLike): FeedableElysiaWebSocketTransport
+  createElysiaWebSocketHandler<LocalAPI>(options: { expose: LocalAPI; timeout?: number }): ElysiaLifecycleHandlers
+  ```
+</ParamField>
+
+## Raw WebSocket server with `ws`
+
+The most portable setup uses the `ws` package on the server and the built-in `WebSocket` on the client.
+
+<CodeGroup>
+```typescript server.ts
+import { expose } from "kkrpc"
+import { webSocketTransport } from "kkrpc/ws"
+import { WebSocketServer } from "ws"
+
+const api = {
+  async greet(name: string): Promise<string> {
+    return `Hello, ${name}!`
+  },
+  math: {
+    add(a: number, b: number): number {
+      return a + b
+    },
+    multiply(a: number, b: number): number {
+      return a * b
+    }
+  }
+}
+
+export type API = typeof api
+
+const wss = new WebSocketServer({ port: 3000 })
+
+wss.on("connection", (socket) => {
+  // Each connection gets its own exposed controller
+  expose(api, webSocketTransport(socket))
+})
+
+console.log("WebSocket RPC server listening on ws://localhost:3000")
+```
+
+```typescript client.ts
+import { wrap } from "kkrpc"
+import { webSocketClientTransport } from "kkrpc/ws"
+import type { API } from "./server"
+
+const api = wrap<API>(webSocketClientTransport({ url: "ws://localhost:3000" }))
+
+console.log(await api.greet("World"))          // Hello, World!
+console.log(await api.math.add(5, 3))          // 8
+console.log(await api.math.multiply(4, 6))     // 24
+```
+</CodeGroup>
+
+## Hono WebSocket server
+
+`createHonoWebSocketHandler` produces a `WSEvents` object that plugs directly into Hono's `upgradeWebSocket` helper. Each connection gets its own `RPCChannel` that is destroyed when the socket closes.
+
+<CodeGroup>
+```typescript server.ts
+import { Hono } from "hono"
+import { upgradeWebSocket, websocket } from "hono/bun"
+import { createHonoWebSocketHandler } from "kkrpc/ws/hono"
+
+const api = {
+  async echo(message: string): Promise<string> {
+    return message
+  },
+  math: {
+    add(a: number, b: number): number {
+      return a + b
+    }
+  }
+}
+
+export type API = typeof api
+
+const app = new Hono()
+
+app.get(
+  "/ws",
+  upgradeWebSocket(() =>
+    createHonoWebSocketHandler<API>({ expose: api })
+  )
+)
+
+Bun.serve({ port: 3001, fetch: app.fetch, websocket })
+console.log("Hono WebSocket RPC server on ws://localhost:3001/ws")
+```
+
+```typescript client.ts
+import { wrap } from "kkrpc"
+import { webSocketClientTransport } from "kkrpc/ws"
+import type { API } from "./server"
+
+const api = wrap<API>(webSocketClientTransport({ url: "ws://localhost:3001/ws" }))
+
+console.log(await api.echo("ping"))     // ping
+console.log(await api.math.add(10, 5)) // 15
+```
+</CodeGroup>
+
+## Elysia WebSocket server
+
+`createElysiaWebSocketHandler` returns `open`, `message`, and `close` handlers that Elysia's `.ws()` route accepts directly.
+
+<CodeGroup>
+```typescript server.ts
+import { Elysia } from "elysia"
+import { createElysiaWebSocketHandler } from "kkrpc/ws/elysia"
+
+const api = {
+  async echo(message: string): Promise<string> {
+    return message
+  },
+  math: {
+    add(a: number, b: number): number {
+      return a + b
+    }
+  }
+}
+
+export type API = typeof api
+
+const app = new Elysia().ws(
+  "/rpc",
+  createElysiaWebSocketHandler<API>({ expose: api })
+)
+
+app.listen({ port: 3002, hostname: "127.0.0.1" })
+console.log("Elysia WebSocket RPC server on ws://127.0.0.1:3002/rpc")
+```
+
+```typescript client.ts
+import { wrap } from "kkrpc"
+import { webSocketClientTransport } from "kkrpc/ws"
+import type { API } from "./server"
+
+const api = wrap<API>(
+  webSocketClientTransport({ url: "ws://127.0.0.1:3002/rpc" })
+)
+
+console.log(await api.echo("hello")) // hello
+console.log(await api.math.add(3, 7)) // 10
+```
+</CodeGroup>
+
+## Bidirectional — server calling the client
+
+Because the connection is persistent, you can expose an API on the client and call it from the server. Use `RPCChannel` with `expose` on both sides.
+
+<CodeGroup>
+```typescript server.ts
+import { RPCChannel } from "kkrpc"
+import { webSocketTransport } from "kkrpc/ws"
+import { WebSocketServer } from "ws"
+import type { ClientAPI } from "./client"
+
+const serverAPI = {
+  async ping(): Promise<string> {
+    return "pong from server"
+  }
+}
+
+export type ServerAPI = typeof serverAPI
+
+const wss = new WebSocketServer({ port: 3000 })
+
+wss.on("connection", (socket) => {
+  const channel = new RPCChannel<ServerAPI, ClientAPI>(
+    webSocketTransport(socket),
+    { expose: serverAPI }
+  )
+
+  // Server can now call back into the client
+  setTimeout(async () => {
+    const client = channel.getAPI()
+    const info = await client.getClientInfo()
+    console.log("Client info:", info)
+  }, 1000)
+})
+```
+
+```typescript client.ts
+import { RPCChannel } from "kkrpc"
+import { webSocketClientTransport } from "kkrpc/ws"
+import type { ServerAPI } from "./server"
+
+const clientAPI = {
+  async getClientInfo(): Promise<{ platform: string }> {
+    return { platform: navigator.platform }
+  }
+}
+
+export type ClientAPI = typeof clientAPI
+
+const channel = new RPCChannel<ClientAPI, ServerAPI>(
+  webSocketClientTransport({ url: "ws://localhost:3000" }),
+  { expose: clientAPI }
+)
+
+const server = channel.getAPI()
+console.log(await server.ping()) // pong from server
+```
+</CodeGroup>
+
+## Connection lifecycle
+
+The WebSocket transport tracks connection close events. When the underlying socket drops (non-1000 close code or network error), an `Error` is passed to any `onClose` listeners registered on the transport. A local `transport.close()` call is treated as intentional teardown and does not trigger `onClose`.
+
+<Note>
+  Messages sent before the WebSocket enters the `OPEN` state are queued in memory and flushed once the connection opens. If the socket never opens, closing the transport discards the queue without delivery.
+</Note>
+
+<Warning>
+  The WebSocket transport does not support transferable objects. Calling `transfer()` on an argument passed over this transport has no effect — the buffer will be serialized by value.
+</Warning>

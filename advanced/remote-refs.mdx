@@ -1,0 +1,255 @@
+---
+title: "Remote References: Comlink-Style Proxy Objects in kkRPC"
+sidebarTitle: "Remote Refs"
+description: "Pass functions and objects by reference across the RPC boundary using proxy(). The kkrpc/remote-refs entry enables Comlink-style explicit remote references with full lifecycle control."
+---
+
+Remote references are an opt-in extension to kkRPC that lets you pass live JavaScript objects and functions across the RPC boundary by reference rather than by value. Instead of serializing a function's source or cloning an object, you mark it with `proxy()` and the channel retains ownership on the sender's side, sending only a compact handle to the receiver. The receiver gets a transparent proxy that forwards every call, property read, or property write back across the wire to the original owner.
+
+This is the kkRPC equivalent of [Comlink](https://github.com/GoogleChromeLabs/comlink)'s `proxy()` — it is available through the `kkrpc/remote-refs` entry, which exports a drop-in replacement for `wrap`, `expose`, and `RPCChannel` with remote reference support built in.
+
+## When to Use Remote Refs
+
+Use remote references when:
+
+- A callback passed as a method argument needs to be invoked multiple times from the remote side.
+- You need to pass a stateful object (such as a file handle or database connection) by reference without copying it.
+- A method should return a live handle that the caller can interact with, without the server needing to expose it as a top-level API method.
+- You want Comlink-style ergonomics where any `proxy()`-marked value crossing the boundary becomes a two-way RPC handle.
+
+<Note>
+  The `kkrpc/remote-refs` entry requires the transport to advertise `capabilities.remoteRefs: true`. Object-mode transports (Workers, iframes) naturally support this because they preserve JavaScript references. String transports that need remote refs should set this capability explicitly when creating the transport.
+</Note>
+
+## Installation
+
+```bash
+npm install kkrpc
+```
+
+Import everything from `kkrpc/remote-refs`. This entry re-exports `wrap`, `expose`, `RPCChannel`, and adds `proxy`, `releaseProxy`, and related helpers.
+
+```typescript
+import {
+  wrap,
+  expose,
+  RPCChannel,
+  proxy,
+  releaseProxy,
+  isRemoteProxy,
+  isRemoteRefEnvelope
+} from "kkrpc/remote-refs"
+```
+
+<Warning>
+  Do not mix the default `kkrpc` entry and `kkrpc/remote-refs` on the same channel. The remote-refs entry exports its own `RPCChannel` (`RemoteReferenceRPCChannel`) that handles the special `op: "ref"` wire messages. Use one or the other consistently on both sides of a connection.
+</Warning>
+
+## `proxy(value)`
+
+Mark an object or function so it crosses the RPC boundary by reference. The marker is stored in a `WeakSet` and is not added to the object itself.
+
+```typescript
+import { proxy } from "kkrpc/remote-refs"
+
+// Mark a function — the receiver gets a callable remote proxy
+const onProgress = proxy((percent: number) => {
+  console.log(`Progress: ${percent}%`)
+})
+
+// Mark an object — the receiver gets a property/method proxy
+const counter = proxy({
+  value: 0,
+  increment() { this.value++ }
+})
+```
+
+Unmarked functions nested inside data objects are rejected at encode time with `RPCEncodeError: "Unmarked function values require proxy() with kkrpc/remote-refs"`. This prevents accidentally leaking same-process references over object-mode transports.
+
+## `releaseProxy(value)`
+
+When the receiver is done with a remote proxy, call `releaseProxy()` to send a release message to the owner and free the retained reference. After release, any further calls on the proxy throw `RPCRemoteReferenceReleasedError`.
+
+```typescript
+import { releaseProxy } from "kkrpc/remote-refs"
+
+const remoteCounter = await client.getAPI().getCounter()
+await remoteCounter.inc(5)
+
+// Release the remote reference when done
+await releaseProxy(remoteCounter)
+
+// Any further call will throw RPCRemoteReferenceReleasedError
+await remoteCounter.inc(1) // throws
+```
+
+`releaseProxy()` is idempotent for non-proxy values — it returns `undefined` without throwing if the argument is not a remote proxy.
+
+## Enabling Remote Refs on a Transport
+
+The transport must advertise `remoteRefs: true` in its capabilities. Transports that use `createTransport()` can set this in the `capabilities` override:
+
+```typescript transport-setup.ts
+import { createTransport } from "kkrpc/transport"
+
+const transport = createTransport({
+  platform,
+  codec,
+  capabilities: {
+    objectMode: true,
+    transfer: true,
+    remoteRefs: true   // required for proxy() to work
+  }
+})
+```
+
+Worker and iframe transports already set `objectMode: true` and `transfer: true`. Add `remoteRefs: true` when constructing manually, or use a `MemoryTransport` in tests with all three set.
+
+You can also disable remote refs on a per-channel basis even when the transport supports them:
+
+```typescript
+const channel = new RPCChannel(transport, {
+  remoteRefs: false   // reject proxy() calls on this channel
+})
+```
+
+## Passing a Callback by Reference
+
+The most common use case: passing a progress callback that the server should call multiple times.
+
+```typescript server.ts
+import { expose } from "kkrpc/remote-refs"
+import { workerSelfTransport } from "kkrpc/worker"
+
+const api = {
+  async runTask(
+    input: string,
+    onProgress: (percent: number) => Promise<void>
+  ): Promise<string> {
+    for (let i = 0; i <= 100; i += 25) {
+      await onProgress(i)
+    }
+    return `Done: ${input}`
+  }
+}
+
+export type API = typeof api
+
+expose(api, workerSelfTransport())
+```
+
+```typescript client.ts
+import { wrap, proxy } from "kkrpc/remote-refs"
+import { workerTransport } from "kkrpc/worker"
+import type { API } from "./server"
+
+const worker = new Worker(new URL("./server.ts", import.meta.url), { type: "module" })
+const remote = wrap<API>(workerTransport(worker))
+
+const result = await remote.runTask("build", proxy(async (percent) => {
+  console.log(`Progress: ${percent}%`)
+}))
+
+console.log(result) // "Done: build"
+```
+
+## Returning an Object Handle
+
+A server method can return a `proxy()`-marked object. The client receives a transparent proxy that supports property reads, property writes, and method calls — all forwarded back over RPC.
+
+```typescript server.ts
+import { expose, proxy } from "kkrpc/remote-refs"
+import { workerSelfTransport } from "kkrpc/worker"
+
+const api = {
+  createCounter(initial: number) {
+    const counter = {
+      value: initial,
+      inc(delta: number) {
+        this.value += delta
+        return this.value
+      }
+    }
+    return proxy(counter)   // cross the boundary by reference
+  }
+}
+
+export type API = typeof api
+expose(api, workerSelfTransport())
+```
+
+```typescript client.ts
+import { wrap, releaseProxy } from "kkrpc/remote-refs"
+import { workerTransport } from "kkrpc/worker"
+import type { API } from "./server"
+
+const worker = new Worker(new URL("./server.ts", import.meta.url), { type: "module" })
+const remote = wrap<API>(workerTransport(worker))
+
+const counter = await remote.createCounter(10)
+
+console.log(await counter.value)      // 10    (remote property get)
+console.log(await counter.inc(5))     // 15    (remote method call)
+counter.value = 0                     // remote property set (fire-and-forget)
+
+await releaseProxy(counter)           // release the retained server-side reference
+```
+
+## Nested Proxies in Data
+
+`proxy()` markers are recognized when the marked value is nested inside a plain array or object argument:
+
+```typescript
+const result = await remote.run({
+  hooks: {
+    onProgress: proxy(async (value: number) => `progress:${value}`)
+  }
+})
+```
+
+The channel walks the argument tree, finds the marked function, retains it locally, and replaces it in the wire message with a compact `RemoteRefEnvelope`. Plain nested objects that do not contain any marked values are sent as-is without copying.
+
+## Pass-Back Identity
+
+If you send the same `proxy()`-marked object in multiple requests, the channel assigns it a stable reference ID and reuses it. The receiver sees the same remote proxy handle for both calls.
+
+## `RPCChannel` and `RemoteReferenceRPCChannelOptions`
+
+The `RPCChannel` exported from `kkrpc/remote-refs` is actually `RemoteReferenceRPCChannel`. It extends the default channel and accepts all the same options plus one extra:
+
+<ParamField body="options.remoteRefs" type="boolean">
+  Set to `false` to disable remote reference support even when the transport advertises `remoteRefs: true`. All `proxy()` calls will throw `RPCEncodeError` at encode time. Defaults to `true` when the transport supports it.
+</ParamField>
+
+## Error Handling
+
+| Error | Cause |
+|---|---|
+| `RPCEncodeError: "Unmarked function values require proxy()"` | A plain function appeared in a data argument without being wrapped in `proxy()`. |
+| `RPCEncodeError: "RPC channel does not support remote references"` | The transport does not have `remoteRefs: true`, or `remoteRefs: false` was passed to the channel options. |
+| `RPCEncodeError: "Remote proxy belongs to a different RPC channel"` | You tried to send a remote proxy decoded by one channel through a different channel. |
+| `RPCRemoteReferenceReleasedError` | A proxy was called after `releaseProxy()` released it. |
+
+## Compatibility with the Default Channel
+
+The `kkrpc/remote-refs` channel can receive top-level callback envelopes from the default `kkrpc` channel. This allows the remote-refs server side to interoperate with a default-entry client that sends callbacks in the legacy top-level encoding:
+
+```typescript interop.ts
+import { RPCChannel as CoreRPCChannel } from "kkrpc"
+import { RPCChannel as RefChannel } from "kkrpc/remote-refs"
+
+// Default client sends a callback in core format
+const client = new CoreRPCChannel<object, { use(cb: (v: string) => void): Promise<string> }>(
+  clientTransport
+)
+
+// Remote-refs server handles it correctly
+const server = new RefChannel<{ use(cb: (v: string) => void): string }, object>(serverTransport, {
+  expose: {
+    use(callback) {
+      callback("from-server")
+      return "done"
+    }
+  }
+})
+```

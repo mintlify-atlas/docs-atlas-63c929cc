@@ -1,0 +1,185 @@
+---
+title: "HTTP Transport for Unary RPC over Standard Fetch"
+sidebarTitle: "HTTP"
+description: "Expose any JavaScript object as a fetch-compatible HTTP RPC endpoint with createHttpHandler and call it type-safely with httpClientTransport from kkrpc/http."
+---
+
+The HTTP transport maps each RPC call to a single POST request and a single JSON response. It requires no persistent connection, making it easy to drop into any existing web server — Express, Hono, Fastify, Bun, Deno, Cloudflare Workers, or any runtime that speaks the Fetch API. The handler returns a standard `Response`, so it composes with whatever routing layer you already have.
+
+Because HTTP is inherently unary (one request → one response), some kkrpc features are unavailable. The server cannot initiate calls back to the client and there is no persistent reverse channel.
+
+## Transport capabilities
+
+| Capability | Supported |
+| --- | --- |
+| Bidirectional calls | ❌ |
+| Callback arguments | ❌ |
+| Transferable objects | ❌ |
+| Async iterable streaming | ❌ |
+
+<Warning>
+  HTTP transport does not support callback arguments, remote references, or async iterable streams. Passing a function or an async generator as a method argument will throw at runtime. Use [WebSocket transport](/transports/websocket) when you need any of these features.
+</Warning>
+
+## API
+
+<ParamField path="createHttpHandler" type="function">
+  Creates a Fetch API request handler that exposes a local API object over unary HTTP. Each request gets a short-lived `RPCChannel` that is destroyed after the response is sent.
+
+  ```typescript
+  import { createHttpHandler } from "kkrpc/http"
+  createHttpHandler<LocalAPI>(api: LocalAPI, options?: HttpHandlerOptions): (request: Request) => Promise<Response>
+  ```
+
+  **`HttpHandlerOptions`**
+  - `timeout?: number` — request-scoped timeout in milliseconds; a timed-out request returns HTTP 504.
+</ParamField>
+
+<ParamField path="httpClientTransport" type="function">
+  Creates a client transport backed by `fetch()` POST requests. Accepts custom headers and a custom `fetch` implementation for environments that provide one.
+
+  ```typescript
+  import { httpClientTransport } from "kkrpc/http"
+  httpClientTransport(options: HttpClientTransportOptions): Transport<RPCMessage>
+  ```
+
+  **`HttpClientTransportOptions`**
+  - `url: string` — absolute or relative endpoint URL.
+  - `headers?: Record<string, string>` — headers merged with the default `Content-Type: application/json`.
+  - `fetch?: typeof fetch` — custom fetch implementation; defaults to global `fetch`.
+</ParamField>
+
+## Bun.serve example
+
+The minimal server passes every `/rpc` POST to the handler and returns 404 for everything else.
+
+<CodeGroup>
+```typescript server.ts
+import { createHttpHandler } from "kkrpc/http"
+
+const api = {
+  async add(a: number, b: number): Promise<number> {
+    return a + b
+  },
+  async greet(name: string): Promise<string> {
+    return `Hello, ${name}!`
+  },
+  math: {
+    multiply(a: number, b: number): number {
+      return a * b
+    }
+  }
+}
+
+export type API = typeof api
+
+const handler = createHttpHandler(api)
+
+Bun.serve({
+  port: 3000,
+  async fetch(req) {
+    const url = new URL(req.url)
+    if (url.pathname !== "/rpc") return new Response("Not found", { status: 404 })
+    if (req.method !== "POST") return new Response("Method not allowed", { status: 405 })
+    return handler(req)
+  }
+})
+
+console.log("HTTP RPC server listening on http://localhost:3000/rpc")
+```
+
+```typescript client.ts
+import { wrap } from "kkrpc"
+import { httpClientTransport } from "kkrpc/http"
+import type { API } from "./server"
+
+const api = wrap<API>(httpClientTransport({ url: "http://localhost:3000/rpc" }))
+
+console.log(await api.add(2, 3))             // 5
+console.log(await api.greet("World"))        // Hello, World!
+console.log(await api.math.multiply(4, 6))   // 24
+```
+</CodeGroup>
+
+## Hono integration
+
+`createHttpHandler` returns a `(request: Request) => Promise<Response>` function that Hono's `c.req.raw` passes through without adaptation.
+
+<CodeGroup>
+```typescript server.ts
+import { Hono } from "hono"
+import { createHttpHandler } from "kkrpc/http"
+
+const api = {
+  async echo(message: string): Promise<string> {
+    return message
+  }
+}
+
+export type API = typeof api
+
+const handler = createHttpHandler(api)
+
+const app = new Hono()
+
+app.post("/rpc", async (c) => {
+  return handler(c.req.raw)
+})
+
+export default { port: 3000, fetch: app.fetch }
+```
+
+```typescript client.ts
+import { wrap } from "kkrpc"
+import { httpClientTransport } from "kkrpc/http"
+import type { API } from "./server"
+
+const api = wrap<API>(httpClientTransport({ url: "http://localhost:3000/rpc" }))
+console.log(await api.echo("hello")) // hello
+```
+</CodeGroup>
+
+## Adding authentication headers
+
+Pass a `headers` object to `httpClientTransport` to attach bearer tokens or API keys to every request.
+
+```typescript client.ts
+import { wrap } from "kkrpc"
+import { httpClientTransport } from "kkrpc/http"
+import type { API } from "./server"
+
+const api = wrap<API>(
+  httpClientTransport({
+    url: "https://api.example.com/rpc",
+    headers: {
+      Authorization: `Bearer ${process.env.API_TOKEN}`
+    }
+  })
+)
+```
+
+## Request timeout
+
+Set `timeout` on the handler to cap how long any single RPC call can run. A timed-out request receives an `RPCTimeoutError` response and an HTTP 504 status code.
+
+```typescript server.ts
+import { createHttpHandler } from "kkrpc/http"
+
+const handler = createHttpHandler(api, { timeout: 5000 }) // 5 s limit per request
+```
+
+## Concurrent requests
+
+The HTTP transport is stateless; each call is an independent POST request. You can fire multiple requests in parallel with `Promise.all` and the server will handle them concurrently.
+
+```typescript client.ts
+const [sum, product] = await Promise.all([
+  api.math.add(10, 20),
+  api.math.multiply(10, 20)
+])
+console.log(sum, product) // 30, 200
+```
+
+<Note>
+  The HTTP transport has no `close()` method because there is no persistent connection to tear down. Each call is fully self-contained — connect, send, receive, done.
+</Note>

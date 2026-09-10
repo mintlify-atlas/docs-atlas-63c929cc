@@ -1,0 +1,510 @@
+---
+title: "Message Bus Transports: Kafka, RabbitMQ, Redis, NATS, Socket.IO"
+sidebarTitle: "Message Buses"
+description: "Connect kkrpc to distributed message buses including Socket.IO, Kafka, RabbitMQ, Redis Streams, and NATS for scalable service-to-service RPC."
+---
+
+Message bus transports let kkrpc communicate across distributed systems where services run in separate processes or machines. Unlike WebSocket or stdio, messages travel through a shared broker that decouples publishers from subscribers. All five transports in this group are bidirectional and support callback arguments. None support transferable objects, because broker payloads are serialized by value.
+
+Each transport wraps RPC messages in a bus envelope that carries the sender's peer ID and an optional target peer ID. Messages from the same peer are filtered on delivery, and explicitly targeted messages are not delivered to other peers. When no `remotePeerId` is specified, the transport operates in broadcast mode, which is suitable for many-to-many fan-out scenarios.
+
+## Socket.IO
+
+Socket.IO already provides a persistent bidirectional event channel. The kkrpc adapter emits RPC messages on a dedicated `"kkrpc:message"` event, keeping kkrpc traffic isolated from any other Socket.IO events on the same socket.
+
+### Install peer dependency
+
+```bash
+npm install socket.io socket.io-client
+```
+
+### API
+
+<ParamField path="socketIoTransport" type="function">
+  Wraps a Socket.IO client or server socket. Both sides use the same factory — pass the socket you have. Closing calls `socket.disconnect()` when available.
+
+  ```typescript
+  import { socketIoTransport } from "kkrpc/socketio"
+  socketIoTransport(socket: SocketLike): Transport<RPCMessage>
+  ```
+</ParamField>
+
+### Example
+
+<CodeGroup>
+```typescript server.ts
+import { createServer } from "node:http"
+import { expose } from "kkrpc"
+import { socketIoTransport } from "kkrpc/socketio"
+import { Server } from "socket.io"
+
+const api = {
+  async greet(name: string): Promise<string> {
+    return `Hello, ${name}!`
+  },
+  math: {
+    add(a: number, b: number): number {
+      return a + b
+    }
+  }
+}
+
+export type API = typeof api
+
+const httpServer = createServer()
+const io = new Server(httpServer)
+
+io.on("connection", (socket) => {
+  // Each connected client gets its own exposed controller
+  expose(api, socketIoTransport(socket))
+})
+
+httpServer.listen(3000)
+```
+
+```typescript client.ts
+import { wrap } from "kkrpc"
+import { socketIoTransport } from "kkrpc/socketio"
+import { io } from "socket.io-client"
+import type { API } from "./server"
+
+const socket = io("http://localhost:3000")
+const api = wrap<API>(socketIoTransport(socket))
+
+console.log(await api.greet("World"))     // Hello, World!
+console.log(await api.math.add(10, 5))    // 15
+```
+</CodeGroup>
+
+---
+
+## Kafka
+
+The Kafka transport uses KafkaJS to publish and consume bus envelopes on a shared topic. It lazily connects on first use, auto-creates the topic if it does not exist, and disconnects producer and consumer on close.
+
+### Install peer dependency
+
+```bash
+npm install kafkajs
+```
+
+### API
+
+<ParamField path="kafkaTransport" type="function">
+  Creates a Kafka-backed transport. Lazily connects producer and consumer on first send or subscription.
+
+  ```typescript
+  import { kafkaTransport } from "kkrpc/kafka"
+  kafkaTransport(options: KafkaTransportOptions): Transport<RPCMessage>
+  ```
+</ParamField>
+
+<Expandable title="KafkaTransportOptions">
+  <ParamField path="localPeerId" type="string" required>
+    Stable identifier for this endpoint. Used to filter self-delivered messages.
+  </ParamField>
+  <ParamField path="remotePeerId" type="string">
+    Optional target peer ID for point-to-point delivery. When omitted, the transport operates in broadcast mode.
+  </ParamField>
+  <ParamField path="brokers" type="string[]" default='["localhost:9092"]'>
+    Kafka broker addresses.
+  </ParamField>
+  <ParamField path="topic" type="string" default='"kkrpc-topic"'>
+    Topic used to exchange bus envelopes.
+  </ParamField>
+  <ParamField path="groupId" type="string">
+    Consumer group ID. Defaults to `"kkrpc-group-{topic}-{localPeerId}"`.
+  </ParamField>
+  <ParamField path="fromBeginning" type="boolean" default="false">
+    Whether the consumer reads from the beginning of the topic on first subscription.
+  </ParamField>
+  <ParamField path="ssl" type="boolean | object">
+    KafkaJS SSL configuration.
+  </ParamField>
+  <ParamField path="sasl" type="object">
+    KafkaJS SASL authentication configuration.
+  </ParamField>
+  <ParamField path="numPartitions" type="number" default="3">
+    Number of partitions when auto-creating the topic.
+  </ParamField>
+  <ParamField path="replicationFactor" type="number" default="1">
+    Replication factor when auto-creating the topic.
+  </ParamField>
+</Expandable>
+
+### Example
+
+<CodeGroup>
+```typescript service-a.ts
+import { RPCChannel } from "kkrpc"
+import { kafkaTransport } from "kkrpc/kafka"
+import type { ServiceBAPI } from "./service-b"
+
+const serviceAAPI = {
+  async status(): Promise<string> {
+    return "service-a is running"
+  }
+}
+
+export type ServiceAAPI = typeof serviceAAPI
+
+const channel = new RPCChannel<ServiceAAPI, ServiceBAPI>(
+  kafkaTransport({
+    brokers: ["localhost:9092"],
+    topic: "kkrpc-services",
+    localPeerId: "service-a",
+    remotePeerId: "service-b"
+  }),
+  { expose: serviceAAPI }
+)
+
+const serviceB = channel.getAPI()
+console.log(await serviceB.compute(7)) // 49
+```
+
+```typescript service-b.ts
+import { RPCChannel } from "kkrpc"
+import { kafkaTransport } from "kkrpc/kafka"
+import type { ServiceAAPI } from "./service-a"
+
+const serviceBAPI = {
+  async compute(n: number): Promise<number> {
+    return n * n
+  }
+}
+
+export type ServiceBAPI = typeof serviceBAPI
+
+const channel = new RPCChannel<ServiceBAPI, ServiceAAPI>(
+  kafkaTransport({
+    brokers: ["localhost:9092"],
+    topic: "kkrpc-services",
+    localPeerId: "service-b",
+    remotePeerId: "service-a"
+  }),
+  { expose: serviceBAPI }
+)
+```
+</CodeGroup>
+
+---
+
+## RabbitMQ
+
+The RabbitMQ transport uses `amqplib` to declare a topic exchange and an exclusive auto-delete queue. Messages are acknowledged or negatively acknowledged based on parse and delivery state, preventing them from accumulating in dead-letter queues.
+
+### Install peer dependency
+
+```bash
+npm install amqplib
+npm install --save-dev @types/amqplib
+```
+
+### API
+
+<ParamField path="rabbitMqTransport" type="function">
+  Creates a RabbitMQ-backed transport. Lazily connects and declares the exchange on first use.
+
+  ```typescript
+  import { rabbitMqTransport } from "kkrpc/rabbitmq"
+  rabbitMqTransport(options: RabbitMQTransportOptions): Transport<RPCMessage>
+  ```
+</ParamField>
+
+<Expandable title="RabbitMQTransportOptions">
+  <ParamField path="localPeerId" type="string" required>
+    Stable identifier for this endpoint.
+  </ParamField>
+  <ParamField path="remotePeerId" type="string">
+    Optional target peer ID for point-to-point delivery.
+  </ParamField>
+  <ParamField path="url" type="string" default='"amqp://localhost"'>
+    AMQP connection URL.
+  </ParamField>
+  <ParamField path="exchange" type="string" default='"kkrpc-exchange"'>
+    Exchange name.
+  </ParamField>
+  <ParamField path="exchangeType" type='"topic" | "direct" | "fanout"' default='"topic"'>
+    Exchange type to assert.
+  </ParamField>
+  <ParamField path="durable" type="boolean" default="true">
+    Whether the exchange and published messages are durable.
+  </ParamField>
+  <ParamField path="routingKeyPrefix" type="string" default='"kkrpc"'>
+    Prefix for routing keys.
+  </ParamField>
+</Expandable>
+
+### Example
+
+<CodeGroup>
+```typescript service-a.ts
+import { RPCChannel } from "kkrpc"
+import { rabbitMqTransport } from "kkrpc/rabbitmq"
+import type { ServiceBAPI } from "./service-b"
+
+const serviceAAPI = {
+  async ping(): Promise<string> {
+    return "pong from A"
+  }
+}
+
+export type ServiceAAPI = typeof serviceAAPI
+
+const channel = new RPCChannel<ServiceAAPI, ServiceBAPI>(
+  rabbitMqTransport({
+    url: "amqp://localhost",
+    localPeerId: "service-a",
+    remotePeerId: "service-b"
+  }),
+  { expose: serviceAAPI }
+)
+
+const serviceB = channel.getAPI()
+console.log(await serviceB.hello("service-a")) // Hello from B, service-a!
+```
+
+```typescript service-b.ts
+import { RPCChannel } from "kkrpc"
+import { rabbitMqTransport } from "kkrpc/rabbitmq"
+import type { ServiceAAPI } from "./service-a"
+
+const serviceBAPI = {
+  async hello(from: string): Promise<string> {
+    return `Hello from B, ${from}!`
+  }
+}
+
+export type ServiceBAPI = typeof serviceBAPI
+
+const channel = new RPCChannel<ServiceBAPI, ServiceAAPI>(
+  rabbitMqTransport({
+    url: "amqp://localhost",
+    localPeerId: "service-b",
+    remotePeerId: "service-a"
+  }),
+  { expose: serviceBAPI }
+)
+```
+</CodeGroup>
+
+---
+
+## Redis Streams
+
+The Redis Streams transport uses `ioredis` to append bus envelopes to a stream with `XADD` and consume them with `XREADGROUP` (consumer groups, with acknowledgement) or plain `XREAD`. It opens two separate connections — one publisher and one subscriber — so reads and writes do not block each other.
+
+### Install peer dependency
+
+```bash
+npm install ioredis
+```
+
+### API
+
+<ParamField path="redisStreamsTransport" type="function">
+  Creates a Redis Streams-backed transport.
+
+  ```typescript
+  import { redisStreamsTransport } from "kkrpc/redis-streams"
+  redisStreamsTransport(options: RedisStreamsTransportOptions): Transport<RPCMessage>
+  ```
+</ParamField>
+
+<Expandable title="RedisStreamsTransportOptions">
+  <ParamField path="localPeerId" type="string" required>
+    Stable identifier for this endpoint.
+  </ParamField>
+  <ParamField path="remotePeerId" type="string">
+    Optional target peer ID for point-to-point delivery.
+  </ParamField>
+  <ParamField path="url" type="string" default='"redis://localhost:6379"'>
+    Redis connection URL.
+  </ParamField>
+  <ParamField path="stream" type="string" default='"kkrpc-stream"'>
+    Stream name.
+  </ParamField>
+  <ParamField path="consumerGroup" type="string">
+    Consumer group for acknowledged reads. Defaults to `"kkrpc-group-{stream}-{localPeerId}"`.
+  </ParamField>
+  <ParamField path="consumerName" type="string">
+    Consumer name within the group. Defaults to `"consumer-{localPeerId}"`.
+  </ParamField>
+  <ParamField path="useConsumerGroup" type="boolean" default="true">
+    Set `false` to use plain `XREAD` without acknowledgement.
+  </ParamField>
+  <ParamField path="blockTimeout" type="number" default="5000">
+    Blocking read timeout in milliseconds.
+  </ParamField>
+  <ParamField path="maxLen" type="number">
+    Approximate maximum stream length; older entries are trimmed on publish.
+  </ParamField>
+</Expandable>
+
+### Example
+
+<CodeGroup>
+```typescript service-a.ts
+import { RPCChannel } from "kkrpc"
+import { redisStreamsTransport } from "kkrpc/redis-streams"
+import type { ServiceBAPI } from "./service-b"
+
+const serviceAAPI = {
+  async ack(message: string): Promise<string> {
+    return `A received: ${message}`
+  }
+}
+
+export type ServiceAAPI = typeof serviceAAPI
+
+const channel = new RPCChannel<ServiceAAPI, ServiceBAPI>(
+  redisStreamsTransport({
+    url: "redis://localhost:6379",
+    localPeerId: "service-a",
+    remotePeerId: "service-b",
+    stream: "kkrpc-demo"
+  }),
+  { expose: serviceAAPI }
+)
+
+const serviceB = channel.getAPI()
+console.log(await serviceB.compute(5)) // 25
+```
+
+```typescript service-b.ts
+import { RPCChannel } from "kkrpc"
+import { redisStreamsTransport } from "kkrpc/redis-streams"
+import type { ServiceAAPI } from "./service-a"
+
+const serviceBAPI = {
+  async compute(n: number): Promise<number> {
+    return n * n
+  }
+}
+
+export type ServiceBAPI = typeof serviceBAPI
+
+const channel = new RPCChannel<ServiceBAPI, ServiceAAPI>(
+  redisStreamsTransport({
+    url: "redis://localhost:6379",
+    localPeerId: "service-b",
+    remotePeerId: "service-a",
+    stream: "kkrpc-demo"
+  }),
+  { expose: serviceBAPI }
+)
+```
+</CodeGroup>
+
+---
+
+## NATS
+
+The NATS transport uses `@nats-io/transport-node` to publish and subscribe on a shared subject. Self-delivered messages are filtered client-side. An optional `queueGroup` distributes messages across multiple subscribers for load balancing.
+
+### Install peer dependency
+
+```bash
+npm install @nats-io/transport-node
+```
+
+### API
+
+<ParamField path="natsTransport" type="function">
+  Creates a NATS-backed transport. Lazily connects on first use.
+
+  ```typescript
+  import { natsTransport } from "kkrpc/nats"
+  natsTransport(options: NatsTransportOptions): Transport<RPCMessage>
+  ```
+</ParamField>
+
+<Expandable title="NatsTransportOptions">
+  <ParamField path="localPeerId" type="string" required>
+    Stable identifier for this endpoint.
+  </ParamField>
+  <ParamField path="remotePeerId" type="string">
+    Optional target peer ID for point-to-point delivery.
+  </ParamField>
+  <ParamField path="servers" type="string | string[]" default='"nats://localhost:4222"'>
+    NATS server URL or array of URLs.
+  </ParamField>
+  <ParamField path="subject" type="string" default='"kkrpc.messages"'>
+    Subject used to exchange bus envelopes.
+  </ParamField>
+  <ParamField path="queueGroup" type="string">
+    Optional queue group for load-balanced subscription.
+  </ParamField>
+  <ParamField path="timeout" type="number" default="10000">
+    NATS connection timeout in milliseconds.
+  </ParamField>
+</Expandable>
+
+### Example
+
+<CodeGroup>
+```typescript service-a.ts
+import { RPCChannel } from "kkrpc"
+import { natsTransport } from "kkrpc/nats"
+import type { ServiceBAPI } from "./service-b"
+
+const serviceAAPI = {
+  async status(): Promise<string> {
+    return "online"
+  }
+}
+
+export type ServiceAAPI = typeof serviceAAPI
+
+const channel = new RPCChannel<ServiceAAPI, ServiceBAPI>(
+  natsTransport({
+    servers: "nats://localhost:4222",
+    subject: "kkrpc.services",
+    localPeerId: "service-a",
+    remotePeerId: "service-b"
+  }),
+  { expose: serviceAAPI }
+)
+
+const serviceB = channel.getAPI()
+console.log(await serviceB.process("hello")) // Processed: hello
+```
+
+```typescript service-b.ts
+import { RPCChannel } from "kkrpc"
+import { natsTransport } from "kkrpc/nats"
+import type { ServiceAAPI } from "./service-a"
+
+const serviceBAPI = {
+  async process(input: string): Promise<string> {
+    return `Processed: ${input}`
+  }
+}
+
+export type ServiceBAPI = typeof serviceBAPI
+
+const channel = new RPCChannel<ServiceBAPI, ServiceAAPI>(
+  natsTransport({
+    servers: "nats://localhost:4222",
+    subject: "kkrpc.services",
+    localPeerId: "service-b",
+    remotePeerId: "service-a"
+  }),
+  { expose: serviceBAPI }
+)
+```
+</CodeGroup>
+
+## Capabilities summary
+
+| Transport | Bidirectional | Callbacks | Transferables | Broadcast mode |
+| --- | --- | --- | --- | --- |
+| Socket.IO | ✅ | ✅ | ❌ | ❌ |
+| Kafka | ✅ | ✅ | ❌ | ✅ |
+| RabbitMQ | ✅ | ✅ | ❌ | ✅ |
+| Redis Streams | ✅ | ✅ | ❌ | ✅ |
+| NATS | ✅ | ✅ | ❌ | ✅ |
+
+<Note>
+  All four broker-backed transports (Kafka, RabbitMQ, Redis Streams, NATS) connect lazily on first `send()` or `subscribe()` call. Call `transport.close()` when the channel is destroyed to disconnect producer and consumer clients and release network resources.
+</Note>

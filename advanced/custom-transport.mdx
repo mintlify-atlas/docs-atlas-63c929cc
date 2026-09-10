@@ -1,0 +1,380 @@
+---
+title: "Building a Custom Transport with createTransport in kkRPC"
+sidebarTitle: "Custom Transport"
+description: "Compose a Platform and Codec into a Transport using createTransport(). Implement custom platforms for any runtime primitive and custom codecs for any wire serialization format."
+---
+
+Every built-in kkRPC transport is built from two pieces: a `Platform` that moves raw wire values over some runtime primitive (a socket, a pipe, a message channel), and a `Codec` that translates between kkRPC's internal `RPCMessage` objects and those wire values. The `createTransport()` function from `kkrpc/transport` composes them into a `Transport<RPCMessage>` that `RPCChannel` can use.
+
+You can implement your own `Platform` or `Codec` to add support for any runtime, protocol, or serialization format without modifying kkRPC's core.
+
+## The Three Interfaces
+
+```typescript
+import type { Platform, Codec, Transport, TransportCapabilities } from "kkrpc/transport"
+```
+
+### `Transport<TMessage>`
+
+The `Transport` interface is what `RPCChannel` directly consumes. You rarely implement this manually — `createTransport()` builds one from a `Platform` and `Codec`.
+
+```typescript
+interface Transport<TMessage> {
+  capabilities?: TransportCapabilities
+  send(message: TMessage, transfers?: Transferable[]): void | Promise<void>
+  subscribe(listener: (message: TMessage) => void): () => void
+  close?(): void
+  onClose?(listener: (reason?: Error) => void): () => void
+}
+```
+
+<ParamField body="send" type="(message, transfers?) => void | Promise<void>" required>
+  Send one message. If the transport supports transferable objects, `transfers` contains the objects to transfer. The implementation should forward them to the underlying primitive.
+</ParamField>
+
+<ParamField body="subscribe" type="(listener) => () => void" required>
+  Register a listener that receives incoming messages. Returns an unsubscribe function. The channel calls it exactly once and stores the unsubscribe callback for cleanup.
+</ParamField>
+
+<ParamField body="close" type="() => void">
+  Close the underlying runtime primitive. Called when the channel is destroyed or the transport is no longer needed.
+</ParamField>
+
+<ParamField body="onClose" type="(listener: (reason?: Error) => void) => () => void">
+  Optionally register a one-time listener for remote connection close events. When present, `RPCChannel` uses it to immediately reject pending requests instead of waiting for their timeouts. `reason` is an `Error` for abnormal disconnection and `undefined` for a clean close.
+</ParamField>
+
+### `Platform<TWire>`
+
+A `Platform` is the raw send/receive adapter for one runtime primitive. It carries values of type `TWire` (usually `string` for text-based channels or `object` for structured-clone channels).
+
+```typescript
+interface Platform<TWire> {
+  capabilities?: PlatformCapabilities
+  send(wire: TWire, transfers?: Transferable[]): void | Promise<void>
+  subscribe(listener: (wire: TWire) => void): () => void
+  close?(): void
+  onClose?(listener: (reason?: Error) => void): () => void
+}
+```
+
+### `Codec<TMessage, TWire>`
+
+A `Codec` translates between `RPCMessage` objects and the platform's wire type.
+
+```typescript
+interface Codec<TMessage, TWire> {
+  capabilities?: CodecCapabilities
+  encode(message: TMessage): TWire
+  decode(wire: TWire): TMessage
+}
+```
+
+## `TransportCapabilities`
+
+The capabilities object describes what the composed transport can do. These flags are read by the channel and relay.
+
+<ParamField body="objectMode" type="boolean">
+  The transport carries JavaScript objects without string serialization (structured-clone-grade). Non-JSON values like `Date`, `Map`, and `undefined` survive. Informational — the core does not branch on this flag.
+</ParamField>
+
+<ParamField body="transfer" type="boolean">
+  The transport can forward transferables with sent messages. `RPCChannel` checks this before attaching transferables to outbound messages.
+</ParamField>
+
+<ParamField body="broadcast" type="boolean">
+  The transport may deliver messages to more than one peer. Informational.
+</ParamField>
+
+<ParamField body="remoteRefs" type="boolean">
+  The transport can carry bidirectional remote-reference request traffic. Required for `proxy()` values from `kkrpc/remote-refs` to work.
+</ParamField>
+
+## `createTransport()`
+
+`createTransport()` composes a `Platform` and a `Codec` into a ready-to-use `Transport<TMessage>`:
+
+```typescript
+import { createTransport } from "kkrpc/transport"
+
+const transport = createTransport({
+  platform,       // Platform<TWire>
+  codec,          // Codec<RPCMessage, TWire>
+  capabilities,   // optional TransportCapabilities overrides
+  onInvalidFrame  // optional (wire, error) => void
+})
+```
+
+<ParamField body="platform" type="Platform<TWire>" required>
+  The wire-level runtime adapter.
+</ParamField>
+
+<ParamField body="codec" type="Codec<TMessage, TWire>" required>
+  The encoder/decoder between messages and wire values.
+</ParamField>
+
+<ParamField body="capabilities" type="TransportCapabilities">
+  Override the composed capabilities. Transfer support is only enabled when **both** the platform and codec advertise `transfer: true` — overrides can only downgrade it, not upgrade an unsafe pair. Other flags like `remoteRefs` and `broadcast` can be freely set here because they are not derived from platform/codec properties.
+</ParamField>
+
+<ParamField body="onInvalidFrame" type="(wire: TWire, error: unknown) => void">
+  Observe wire values that `codec.decode()` could not parse. When provided, decode errors are reported here and the frame is silently dropped instead of propagating through the receive loop. This is essential for transports that carry a mix of kkRPC frames and other protocols (for example, a WebSocket channel that also receives ping/pong frames).
+</ParamField>
+
+## Example: In-Memory Test Transport
+
+An in-memory transport is the simplest possible custom transport. It is useful for unit tests without real I/O.
+
+```typescript memory-transport.ts
+import type { Platform, PlatformCapabilities } from "kkrpc/transport"
+import type { RPCMessage } from "kkrpc"
+
+export class MemoryPlatform implements Platform<RPCMessage> {
+  capabilities: PlatformCapabilities = { objectMode: true, transfer: true }
+
+  // Connect two MemoryPlatform instances together
+  peer?: MemoryPlatform
+  private listeners = new Set<(message: RPCMessage) => void>()
+
+  send(message: RPCMessage): void {
+    // Deliver asynchronously to simulate real transport behavior
+    queueMicrotask(() => {
+      for (const listener of this.peer?.listeners ?? []) {
+        listener(message)
+      }
+    })
+  }
+
+  subscribe(listener: (message: RPCMessage) => void): () => void {
+    this.listeners.add(listener)
+    return () => this.listeners.delete(listener)
+  }
+
+  close(): void {
+    this.listeners.clear()
+  }
+}
+
+export function createMemoryPair(): [MemoryPlatform, MemoryPlatform] {
+  const a = new MemoryPlatform()
+  const b = new MemoryPlatform()
+  a.peer = b
+  b.peer = a
+  return [a, b]
+}
+```
+
+Since `MemoryPlatform` already carries `RPCMessage` objects (object-mode), use the identity codec from `kkrpc/codecs`:
+
+```typescript
+import { createTransport } from "kkrpc/transport"
+import { objectCodec } from "kkrpc/codecs"
+import { createMemoryPair } from "./memory-transport"
+
+const [platformA, platformB] = createMemoryPair()
+
+const transportA = createTransport({
+  platform: platformA,
+  codec: objectCodec(),
+  capabilities: { objectMode: true, transfer: true, remoteRefs: true }
+})
+
+const transportB = createTransport({
+  platform: platformB,
+  codec: objectCodec(),
+  capabilities: { objectMode: true, transfer: true, remoteRefs: true }
+})
+```
+
+## Example: EventEmitter-Based Transport
+
+This example wraps Node.js `EventEmitter` into a platform, using JSON-line encoding for the wire format.
+
+```typescript eventemitter-transport.ts
+import { EventEmitter } from "node:events"
+import type { Platform, PlatformCapabilities } from "kkrpc/transport"
+
+export class EventEmitterPlatform implements Platform<string> {
+  capabilities: PlatformCapabilities = { objectMode: false }
+
+  constructor(
+    private readonly emitter: EventEmitter,
+    private readonly sendEvent: string,
+    private readonly receiveEvent: string
+  ) {}
+
+  send(wire: string): void {
+    this.emitter.emit(this.sendEvent, wire)
+  }
+
+  subscribe(listener: (wire: string) => void): () => void {
+    this.emitter.on(this.receiveEvent, listener)
+    return () => this.emitter.off(this.receiveEvent, listener)
+  }
+
+  close(): void {
+    this.emitter.removeAllListeners(this.receiveEvent)
+  }
+}
+```
+
+Wire it up with the built-in JSON codec:
+
+```typescript
+import { createTransport } from "kkrpc/transport"
+import { jsonCodec } from "kkrpc/codecs"
+import { EventEmitter } from "node:events"
+import { EventEmitterPlatform } from "./eventemitter-transport"
+
+const bus = new EventEmitter()
+
+// Two platforms sharing the same bus, listening on swapped events
+const platformA = new EventEmitterPlatform(bus, "a-to-b", "b-to-a")
+const platformB = new EventEmitterPlatform(bus, "b-to-a", "a-to-b")
+
+const transportA = createTransport({ platform: platformA, codec: jsonCodec() })
+const transportB = createTransport({ platform: platformB, codec: jsonCodec() })
+```
+
+## Example: Custom Codec
+
+Implement a `Codec` when you need a different serialization format. Here is a MessagePack codec skeleton:
+
+```typescript msgpack-codec.ts
+import type { Codec } from "kkrpc/transport"
+import type { RPCMessage } from "kkrpc"
+import { encode, decode } from "@msgpack/msgpack"
+
+export function msgpackCodec(): Codec<RPCMessage, Uint8Array> {
+  return {
+    capabilities: { transfer: false },
+    encode(message: RPCMessage): Uint8Array {
+      return encode(message)
+    },
+    decode(wire: Uint8Array): RPCMessage {
+      return decode(wire) as RPCMessage
+    }
+  }
+}
+```
+
+Use it with any binary-capable platform:
+
+```typescript
+import { createTransport } from "kkrpc/transport"
+import { msgpackCodec } from "./msgpack-codec"
+
+const transport = createTransport({
+  platform: binaryPlatform,
+  codec: msgpackCodec()
+})
+```
+
+## Handling Mixed-Protocol Transports
+
+Some transports carry a mix of kkRPC frames and other protocol messages on the same channel. Use `onInvalidFrame` to silently drop non-kkRPC frames instead of crashing the receive loop:
+
+```typescript mixed-transport.ts
+import { createTransport } from "kkrpc/transport"
+import { jsonCodec } from "kkrpc/codecs"
+
+const transport = createTransport({
+  platform: webSocketPlatform,
+  codec: jsonCodec(),
+  onInvalidFrame(wire, error) {
+    // Wire value was not a valid kkRPC message — log and drop it
+    console.warn("[kkrpc] Dropped non-RPC frame:", wire, error)
+  }
+})
+```
+
+Without `onInvalidFrame`, decode errors propagate synchronously through the platform's receive loop and can crash the subscription chain.
+
+## Complete Working Example
+
+This example builds an in-memory transport pair and uses it with `expose()` and `wrap()`:
+
+```typescript in-memory-example.ts
+import { expose, wrap } from "kkrpc"
+import { createTransport } from "kkrpc/transport"
+import { objectCodec } from "kkrpc/codecs"
+import type { RPCMessage } from "kkrpc"
+import type { Platform } from "kkrpc/transport"
+
+// --- In-memory platform ---
+class MemoryPlatform implements Platform<RPCMessage> {
+  capabilities = { objectMode: true as const, transfer: true as const }
+  peer?: MemoryPlatform
+  private listeners = new Set<(m: RPCMessage) => void>()
+
+  send(message: RPCMessage): void {
+    queueMicrotask(() => {
+      for (const l of this.peer?.listeners ?? []) l(message)
+    })
+  }
+
+  subscribe(listener: (m: RPCMessage) => void): () => void {
+    this.listeners.add(listener)
+    return () => this.listeners.delete(listener)
+  }
+
+  close(): void {
+    this.listeners.clear()
+  }
+}
+
+function createPair() {
+  const a = new MemoryPlatform()
+  const b = new MemoryPlatform()
+  a.peer = b
+  b.peer = a
+
+  const transportA = createTransport({ platform: a, codec: objectCodec() })
+  const transportB = createTransport({ platform: b, codec: objectCodec() })
+  return { transportA, transportB }
+}
+
+// --- API ---
+const api = {
+  math: {
+    add: async (a: number, b: number) => a + b,
+    multiply: async (a: number, b: number) => a * b
+  },
+  greet: async (name: string) => `Hello, ${name}!`
+}
+
+export type API = typeof api
+
+// --- Wiring ---
+const { transportA, transportB } = createPair()
+
+const controller = expose(api, transportB)
+const remote = wrap<API>(transportA)
+
+// --- Usage ---
+console.log(await remote.greet("World"))         // Hello, World!
+console.log(await remote.math.add(3, 4))         // 7
+console.log(await remote.math.multiply(6, 7))    // 42
+
+controller.dispose()
+```
+
+## Checklist for Custom Platforms
+
+<Steps>
+  <Step title="Implement send and subscribe">
+    `send(wire, transfers?)` delivers one outgoing wire value. `subscribe(listener)` returns an unsubscribe callback. These two are the minimum required surface.
+  </Step>
+  <Step title="Declare capabilities honestly">
+    Set `objectMode: true` only if the platform passes JavaScript objects through structured-clone without JSON serialization. Set `transfer: true` only if `send()` actually forwards the `transfers` array to the underlying primitive.
+  </Step>
+  <Step title="Implement close() for cleanup">
+    Call any runtime cleanup (close sockets, kill streams, remove event listeners) inside `close()`. The channel calls it when destroyed.
+  </Step>
+  <Step title="Implement onClose() for connection drop detection">
+    When the underlying primitive can signal a remote disconnection (socket close, process exit), implement `onClose(listener)` so the channel can immediately reject pending requests rather than waiting for timeouts.
+  </Step>
+  <Step title="Forward transfers only when advertised">
+    If your platform passes `transfers` to a `postMessage`-style API, set `capabilities.transfer = true`. If it does not, leave it unset so `createTransport` knows not to forward them.
+  </Step>
+</Steps>

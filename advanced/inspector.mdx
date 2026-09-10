@@ -1,0 +1,352 @@
+---
+title: "Inspector: Observability and Traffic Monitoring for kkRPC"
+sidebarTitle: "Inspector"
+description: "Attach KKRPCInspector to any channel to record request, response, and error events. Use MemoryBackend for tests and consoleBackend for local debugging."
+---
+
+The inspector is kkRPC's built-in observability layer. It works as an `RPCPlugin` that listens to request, response, and error hooks and writes normalized `InspectEvent` records to one or more backends. The inspector does not modify any behavior — it only observes. You can attach it to a server, a client, or both, and distinguish the traffic from each endpoint with a `sessionId` string.
+
+## Installation
+
+```bash
+npm install kkrpc
+```
+
+Import from the `kkrpc/inspector` subpath export:
+
+```typescript
+import {
+  createInspector,
+  KKRPCInspector,
+  MemoryBackend,
+  consoleBackend,
+  inspectorPlugin
+} from "kkrpc/inspector"
+```
+
+## Creating an Inspector
+
+`createInspector(config?)` returns a `KKRPCInspector` instance. Without arguments it creates an inspector with no backends attached — you can add them later with `addBackend()`.
+
+```typescript
+import { createInspector } from "kkrpc/inspector"
+
+// Inspector with no backends (attach later)
+const inspector = createInspector()
+
+// Inspector with a console backend
+import { consoleBackend } from "kkrpc/inspector"
+
+const inspector = createInspector({
+  backends: [consoleBackend()],
+  options: {
+    trackLatency: true
+  }
+})
+```
+
+<ParamField body="config.backends" type="InspectorBackend[]">
+  Backends that receive sanitized events. Can be `MemoryBackend` instances, `consoleBackend()`, or any custom object implementing `log(event)`.
+</ParamField>
+
+<ParamField body="config.options.filter" type="(event: InspectEvent) => boolean">
+  Drop events for which the predicate returns `false`. Runs before `sanitize` and before recording.
+</ParamField>
+
+<ParamField body="config.options.sanitize" type="(event: InspectEvent) => InspectEvent">
+  Transform or redact events before they are recorded. Use this to remove sensitive data from logged arguments.
+</ParamField>
+
+<ParamField body="config.options.trackLatency" type="boolean">
+  When `true`, the inspector records the timestamp of each `q` (request) event and computes the elapsed milliseconds when the matching `r` (response) arrives. Latency samples are included in `getStats().avgLatency`.
+</ParamField>
+
+## The `InspectEvent` Shape
+
+Every event written to backends has this structure:
+
+```typescript
+interface InspectEvent {
+  timestamp: number             // Unix ms when the event was emitted
+  direction: "sent" | "received"
+  sessionId: string             // distinguishes endpoints or test cases
+  message: RPCMessage           // compact RPC protocol message
+  duration?: number             // response latency in ms (when trackLatency is on)
+}
+```
+
+The `message` field is a compact `RPCMessage`. Requests have `t: "q"`, responses have `t: "r"`. The `direction` field is always relative to the endpoint the inspector is attached to: `"received"` for incoming requests, `"sent"` for outgoing responses.
+
+## Attaching to a Channel
+
+Call `inspector.plugin(sessionId)` to get an `RPCPlugin` and pass it to `expose()` or `RPCChannel`:
+
+<Tabs>
+  <Tab title="expose()">
+    ```typescript server.ts
+    import { expose } from "kkrpc"
+    import { createInspector, MemoryBackend } from "kkrpc/inspector"
+
+    const backend = new MemoryBackend()
+    const inspector = createInspector({
+      backends: [backend],
+      options: { trackLatency: true }
+    })
+
+    const api = {
+      math: {
+        add: async (a: number, b: number) => a + b
+      }
+    }
+
+    expose(api, transport, {
+      plugins: [inspector.plugin("server")]
+    })
+    ```
+  </Tab>
+  <Tab title="RPCChannel">
+    ```typescript server.ts
+    import { RPCChannel } from "kkrpc"
+    import { createInspector, consoleBackend } from "kkrpc/inspector"
+
+    const inspector = createInspector({
+      backends: [consoleBackend(true)], // pretty = true
+      options: { trackLatency: true }
+    })
+
+    const channel = new RPCChannel(transport, {
+      expose: api,
+      plugins: [inspector.plugin("server")]
+    })
+    ```
+  </Tab>
+</Tabs>
+
+## Backends
+
+### `MemoryBackend`
+
+`MemoryBackend` stores events in an array and exposes a `query()` method for filtering by session or direction. It is ideal for tests and local assertions.
+
+```typescript test.ts
+import { createInspector, MemoryBackend } from "kkrpc/inspector"
+import { expose, wrap } from "kkrpc"
+
+const backend = new MemoryBackend()
+const inspector = createInspector({ backends: [backend] })
+
+// Attach to the server
+expose(api, serverTransport, {
+  plugins: [inspector.plugin("server")]
+})
+
+// Make some calls
+const remote = wrap<typeof api>(clientTransport)
+await remote.math.add(1, 2)
+await remote.math.add(10, 20)
+
+// Query stored events
+const allEvents = backend.events
+const serverReceived = backend.query({ direction: "received" })
+const serverSent = backend.query({ direction: "sent" })
+
+console.log("Total events:", allEvents.length)
+console.log("Requests handled:", serverReceived.length)
+```
+
+<ParamField body="backend.events" type="InspectEvent[]">
+  All stored inspector events in insertion order.
+</ParamField>
+
+<ParamField body="backend.query(query)" type="InspectEvent[]">
+  Return stored events filtered by optional `sessionId` and/or `direction`. An empty query object returns all events.
+</ParamField>
+
+<ParamField body="backend.clear()" type="void">
+  Remove all stored events. Useful between test cases.
+</ParamField>
+
+### `consoleBackend(pretty?)`
+
+Writes JSON-serialized events to `console.log`. Pass `true` for pretty-printed output.
+
+```typescript
+import { consoleBackend } from "kkrpc/inspector"
+
+const inspector = createInspector({
+  backends: [consoleBackend(true)]
+})
+```
+
+### Custom Backend
+
+Any object with a `log(event)` method is a valid backend. Optionally implement `flush()` and `destroy()`:
+
+```typescript custom-backend.ts
+import type { InspectorBackend, InspectEvent } from "kkrpc/inspector"
+
+class TelemetryBackend implements InspectorBackend {
+  private buffer: InspectEvent[] = []
+
+  log(event: InspectEvent): void {
+    this.buffer.push(event)
+  }
+
+  async flush(): Promise<void> {
+    const batch = this.buffer.splice(0)
+    await sendToTelemetryService(batch)
+  }
+
+  destroy(): void {
+    this.buffer.length = 0
+  }
+}
+```
+
+## Managing Backends Dynamically
+
+You can add and remove backends on a live inspector without creating a new one.
+
+```typescript
+const inspector = createInspector()
+const memory = new MemoryBackend()
+
+inspector.addBackend(memory)
+
+// Later — removes and calls memory.destroy()
+inspector.removeBackend(memory)
+```
+
+## Inspector Statistics
+
+`inspector.getStats()` returns a defensive snapshot of aggregate counters. When `trackLatency` is enabled, `avgLatency` is populated.
+
+```typescript stats.ts
+import { createInspector, MemoryBackend } from "kkrpc/inspector"
+
+const inspector = createInspector({
+  options: { trackLatency: true }
+})
+
+// ... after some traffic ...
+
+const stats = inspector.getStats()
+console.log("Total messages:", stats.totalMessages)
+console.log("Received:", stats.received)
+console.log("Sent:", stats.sent)
+console.log("Errors:", stats.errors)
+console.log("Avg latency:", stats.avgLatency, "ms")
+console.log("Method counts:", stats.methodCounts)
+// Map { "math.add" => 10, "users.create" => 3 }
+```
+
+The `InspectorStats` shape:
+
+```typescript
+interface InspectorStats {
+  totalMessages: number
+  sent: number
+  received: number
+  errors: number
+  avgLatency?: number                  // present when trackLatency has samples
+  methodCounts: Map<string, number>    // count per dot-joined method path
+}
+```
+
+## Filtering and Sanitization
+
+Use `filter` to suppress events you do not care about, and `sanitize` to redact sensitive fields before they reach any backend.
+
+```typescript filtered-inspector.ts
+import { createInspector, MemoryBackend } from "kkrpc/inspector"
+
+const backend = new MemoryBackend()
+
+const inspector = createInspector({
+  backends: [backend],
+  options: {
+    // Only record call requests, not property get/set
+    filter: (event) =>
+      event.message.t !== "r",
+
+    // Remove argument payloads from stored events
+    sanitize: (event) => {
+      if (event.message.t === "q") {
+        return {
+          ...event,
+          message: { ...event.message, a: undefined }
+        }
+      }
+      return event
+    }
+  }
+})
+```
+
+## Complete Example
+
+This example attaches a single inspector to both server and client endpoints using different `sessionId` values, then queries events after a round-trip.
+
+```typescript inspector-example.ts
+import { RPCChannel } from "kkrpc"
+import { workerTransport, workerSelfTransport } from "kkrpc/worker"
+import { createInspector, MemoryBackend } from "kkrpc/inspector"
+
+// Shared inspector with a memory backend
+const backend = new MemoryBackend()
+const inspector = createInspector({
+  backends: [backend],
+  options: { trackLatency: true }
+})
+
+// --- Worker (server side) ---
+const api = {
+  greet: async (name: string) => `Hello, ${name}`
+}
+export type API = typeof api
+
+const serverChannel = new RPCChannel(workerSelfTransport(), {
+  expose: api,
+  plugins: [inspector.plugin("worker")]
+})
+
+// --- Main thread (client side) ---
+const worker = new Worker(new URL("./worker.ts", import.meta.url), { type: "module" })
+const clientChannel = new RPCChannel<object, API>(workerTransport(worker), {
+  plugins: [inspector.plugin("main")]
+})
+const remote = clientChannel.getAPI()
+
+await remote.greet("World")
+
+// Query results
+const workerEvents = backend.query({ sessionId: "worker" })
+const mainEvents = backend.query({ sessionId: "main" })
+const stats = inspector.getStats()
+
+console.log("Worker received requests:", workerEvents.filter(e => e.direction === "received").length)
+console.log("Avg latency:", stats.avgLatency, "ms")
+
+// Cleanup
+inspector.destroy()
+```
+
+## Lifecycle
+
+<Steps>
+  <Step title="Create">
+    `createInspector(config?)` or `new KKRPCInspector(config)`.
+  </Step>
+  <Step title="Attach">
+    Call `inspector.plugin(sessionId)` and pass the result to the `plugins` array on `expose()` or `RPCChannel`.
+  </Step>
+  <Step title="Query">
+    Use `getStats()` for aggregate counts, or query a `MemoryBackend` for individual events.
+  </Step>
+  <Step title="Flush">
+    Call `await inspector.flush()` to flush all backends before process exit.
+  </Step>
+  <Step title="Destroy">
+    Call `inspector.destroy()` to release backends, clear latency maps, and stop recording.
+  </Step>
+</Steps>

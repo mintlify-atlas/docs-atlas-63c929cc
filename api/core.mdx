@@ -1,0 +1,506 @@
+---
+title: "kkRPC Core API: wrap, expose, dispose, transfer"
+sidebarTitle: "Core Exports"
+description: "Reference for the kkrpc entry: wrap, expose, dispose, transfer, withCallOptions, releaseCallback, error classes, and all RPCMessage protocol types."
+---
+
+The main `kkrpc` package exports everything you need to connect two endpoints: a factory (`wrap`) for
+creating a typed client proxy, a publisher (`expose`) for serving a local API, a tear-down helper
+(`dispose`), and utilities for transferables, per-call options, and callback lifecycle. Import all of
+these from the bare `"kkrpc"` specifier — transports live in subpath entries such as `"kkrpc/ws"`.
+
+## Functions
+
+### `wrap`
+
+```typescript
+function wrap<RemoteAPI extends object = object>(
+  transport: Transport<RPCMessage>,
+  options?: Omit<RPCChannelOptions<object>, "expose">
+): RemoteAPI
+```
+
+Creates a typed proxy for a remote API exposed on the other side of a transport. The returned proxy
+is registered in an internal `WeakMap` so `dispose(proxy)` can tear down the underlying channel
+without you holding a separate reference to it.
+
+```typescript wrap-example.ts
+import { wrap } from "kkrpc"
+import { webSocketClientTransport } from "kkrpc/ws"
+
+interface RemoteAPI {
+  math: { add(a: number, b: number): Promise<number> }
+  echo<T>(value: T): Promise<T>
+}
+
+const api = wrap<RemoteAPI>(
+  webSocketClientTransport({ url: "ws://localhost:3000" })
+)
+
+const sum = await api.math.add(3, 4)      // → 7
+const msg = await api.echo("hello RPC")  // → "hello RPC"
+```
+
+<ParamField path="transport" type="Transport<RPCMessage>" required>
+  The message-level transport to communicate over. Obtain one from a subpath export such as
+  `kkrpc/ws`, `kkrpc/worker`, or `kkrpc/stdio`.
+</ParamField>
+
+<ParamField path="options" type="Omit<RPCChannelOptions, 'expose'>">
+  Optional channel configuration. All fields from `RPCChannelOptions` are accepted except `expose`,
+  which is reserved for `expose()`. See [`RPCChannelOptions`](/api/rpc-channel#rpcchaneloptions) for
+  the full field list.
+</ParamField>
+
+---
+
+### `expose`
+
+```typescript
+function expose<LocalAPI extends object, RemoteAPI extends object = object>(
+  api: LocalAPI,
+  transport: Transport<RPCMessage>,
+  options?: Omit<RPCChannelOptions<LocalAPI>, "expose">
+): ExposedController<LocalAPI, RemoteAPI>
+```
+
+Publishes a local API object on a transport so the remote side can call it. The returned
+`ExposedController` gives you both a `dispose()` shortcut and access to the bidirectional channel
+when you also need to call back into the remote peer.
+
+```typescript server.ts
+import { expose } from "kkrpc"
+import { nodeStdioTransport } from "kkrpc/stdio"
+
+const api = {
+  math: {
+    add(a: number, b: number) { return a + b }
+  },
+  echo<T>(value: T) { return value },
+  withCallback(value: string, cb: (payload: string) => void) {
+    cb(`callback:${value}`)
+    return "callback-sent"
+  }
+}
+
+const controller = expose(api, nodeStdioTransport())
+
+process.on("SIGTERM", () => {
+  controller.dispose()
+  process.exit(0)
+})
+```
+
+<ParamField path="api" type="LocalAPI" required>
+  The local object to expose. Nested objects are supported; the channel resolves property paths such
+  as `["math", "add"]` automatically.
+</ParamField>
+
+<ParamField path="transport" type="Transport<RPCMessage>" required>
+  Transport to listen and respond on.
+</ParamField>
+
+<ParamField path="options" type="Omit<RPCChannelOptions, 'expose'>">
+  Optional channel configuration. Accepts all fields from `RPCChannelOptions` except `expose`.
+</ParamField>
+
+#### `ExposedController`
+
+```typescript
+interface ExposedController<LocalAPI extends object, RemoteAPI extends object> {
+  channel: RPCChannel<LocalAPI, RemoteAPI>
+  dispose(): void
+}
+```
+
+<ParamField path="channel" type="RPCChannel<LocalAPI, RemoteAPI>">
+  The underlying channel. Call `channel.getAPI()` to obtain a typed proxy for the remote side on a
+  bidirectional connection.
+</ParamField>
+
+<ParamField path="dispose" type="() => void">
+  Destroys the underlying channel: unsubscribes from the transport, rejects all pending requests,
+  and releases callback registry entries.
+</ParamField>
+
+---
+
+### `dispose`
+
+```typescript
+function dispose(api: object): void
+```
+
+Destroys the channel that was created internally by `wrap()`. Pass the same proxy object that
+`wrap()` returned. If the proxy is not recognized (e.g. it was already disposed or created by
+`RPCChannel` directly), the call is a no-op.
+
+```typescript client.ts
+import { wrap, dispose } from "kkrpc"
+import { workerTransport } from "kkrpc/worker"
+
+const worker = new Worker("./worker.js")
+const api = wrap<WorkerAPI>(workerTransport(worker))
+
+await api.doWork()
+dispose(api)   // closes the channel; api is now unusable
+```
+
+<Note>
+  `dispose` only works on proxies returned by `wrap()`. For channels created with `new RPCChannel()`
+  directly, call `channel.destroy()`. For channels from `expose()`, call
+  `controller.dispose()`.
+</Note>
+
+---
+
+### `transfer`
+
+```typescript
+function transfer<T>(value: T, transfers: Transferable[]): T
+```
+
+Marks an object so that the named transferables are forwarded to the underlying platform send
+operation on the next RPC encode pass. The descriptor is consumed exactly once; after encoding, the
+cache entry is removed. `RPCChannel` only forwards the transfer list when the transport reports
+`capabilities.transfer === true`.
+
+```typescript transferable.ts
+import { wrap, transfer } from "kkrpc"
+import { workerTransport } from "kkrpc/worker"
+
+const api = wrap<WorkerAPI>(workerTransport(worker))
+
+const buffer = new ArrayBuffer(4 * 1024 * 1024) // 4 MB
+// Transfer ownership instead of copying:
+await api.processBuffer(transfer(buffer, [buffer]))
+```
+
+<ParamField path="value" type="T extends object" required>
+  The object to annotate. Must be a non-null object; primitives throw immediately.
+</ParamField>
+
+<ParamField path="transfers" type="Transferable[]" required>
+  Array of `Transferable` objects (e.g. `ArrayBuffer`, `MessagePort`, `OffscreenCanvas`) that
+  should be moved rather than cloned.
+</ParamField>
+
+#### `TransferDescriptor`
+
+```typescript
+interface TransferDescriptor {
+  value: unknown
+  transfers: Transferable[]
+  handler?: string
+}
+```
+
+The internal shape stored by `transfer()`. You rarely need to interact with this directly.
+
+---
+
+### `withCallOptions`
+
+```typescript
+function withCallOptions<T extends object>(api: T, options: CallOptions): T
+```
+
+Derives a new proxy from an existing remote proxy whose calls use per-call `timeout` and/or
+`AbortSignal` overrides without changing the channel-level default. Throws `TypeError` if the value
+is not a kkrpc remote proxy.
+
+```typescript call-options.ts
+import { wrap, withCallOptions } from "kkrpc"
+import { webSocketClientTransport } from "kkrpc/ws"
+
+const api = wrap<RemoteAPI>(webSocketClientTransport({ url: "ws://localhost:3000" }))
+
+// All calls through `quick` time out after 2 s instead of the channel default:
+const quick = withCallOptions(api, { timeout: 2000 })
+await quick.slowOperation()
+
+// Cancelable group of calls:
+const controller = new AbortController()
+const cancelable = withCallOptions(api, { signal: controller.signal })
+cancelable.longRunning().catch(() => {})
+controller.abort()
+```
+
+#### `CallOptions`
+
+```typescript
+interface CallOptions {
+  timeout?: number
+  signal?: AbortSignal
+}
+```
+
+<ParamField path="timeout" type="number">
+  Timeout in milliseconds for calls made through this proxy. Overrides the channel default; `0`
+  disables the timeout entirely for these calls.
+</ParamField>
+
+<ParamField path="signal" type="AbortSignal">
+  Abort signal that rejects in-flight calls made through the derived proxy. When the signal fires,
+  all pending calls reject with an `AbortError`.
+</ParamField>
+
+---
+
+### `releaseCallback`
+
+```typescript
+function releaseCallback(callback: unknown): boolean
+```
+
+Deterministically releases a decoded callback facade. When you receive a function argument from a
+remote call, kkrpc creates a _callback facade_ backed by a registry entry on the originating side.
+On runtimes without `FinalizationRegistry` that entry lives until the channel is destroyed.
+`releaseCallback` signals the owner to drop it immediately.
+
+Returns `true` when the value was a live callback facade; `false` otherwise (safe to call on any
+value).
+
+```typescript callback-release.ts
+import { expose, releaseCallback } from "kkrpc"
+import { nodeStdioTransport } from "kkrpc/stdio"
+
+const api = {
+  subscribe(cb: (event: string) => void) {
+    const timer = setInterval(() => cb("tick"), 1000)
+    return {
+      unsubscribe() {
+        clearInterval(timer)
+        releaseCallback(cb)  // free the registry entry on the caller's side
+      }
+    }
+  }
+}
+
+expose(api, nodeStdioTransport())
+```
+
+---
+
+## Error Classes
+
+### `RPCCallbackReleasedError`
+
+```typescript
+class RPCCallbackReleasedError extends Error {
+  constructor(id: string)
+  name: "RPCCallbackReleasedError"
+}
+```
+
+Thrown when a callback facade is invoked after it has already been released via `releaseCallback()`
+or collected by the garbage collector (on runtimes with `FinalizationRegistry`). Catch this in your
+server-side code when you explicitly release callbacks and want to guard against stale invocations.
+
+---
+
+### `RPCTransportClosedError`
+
+```typescript
+class RPCTransportClosedError extends Error {
+  constructor(reason?: Error)
+  name: "RPCTransportClosedError"
+  cause?: Error
+}
+```
+
+Rejection reason for all pending requests when the underlying transport connection closes
+unexpectedly. The optional `cause` field holds the original transport-level error for abnormal
+terminations. Requests made after the transport has closed also reject immediately with this error.
+
+---
+
+## Protocol Types
+
+These compact record types are the wire format sent between `RPCChannel` instances. You typically do
+not construct them directly, but they are useful when building custom transports, middleware, or
+inspector backends.
+
+### `RPCMessage`
+
+```typescript
+type RPCMessage =
+  | RPCRequest
+  | RPCResponse
+  | RPCCallback
+  | RPCCallbackRelease
+  | RPCStreamRequest
+  | RPCStreamResponse
+```
+
+The union of all message kinds accepted by a channel's transport. The discriminant field `t`
+identifies the kind.
+
+---
+
+### `RPCRequest`
+
+```typescript
+interface RPCRequest {
+  t: "q"
+  id: string
+  op: RPCOperation
+  p: string[]
+  a?: unknown[]
+  v?: unknown
+  meta?: RPCMessageMetadata
+}
+```
+
+Sent by the caller to invoke a remote operation. `p` is the dot-separated path to the target
+on the exposed API; `a` carries encoded arguments; `v` carries a setter value.
+
+---
+
+### `RPCResponse`
+
+```typescript
+interface RPCResponse {
+  t: "r"
+  id: string
+  v?: unknown
+  e?: RPCError
+}
+```
+
+Sent by the handler to resolve or reject the matching request. Exactly one of `v` (success) or `e`
+(error) is present.
+
+---
+
+### `RPCCallback`
+
+```typescript
+interface RPCCallback {
+  t: "cb"
+  id: string
+  a: unknown[]
+}
+```
+
+Sent to invoke a callback function that was passed as an argument in a previous request. `id`
+matches the registry entry on the owning side.
+
+---
+
+### `RPCCallbackRelease`
+
+```typescript
+interface RPCCallbackRelease {
+  t: "cbr"
+  ids: string[]
+}
+```
+
+Best-effort notification sent by the decoder side to tell the owner it no longer holds facades for
+the listed callback ids. The owner drops the matching entries from its registry.
+
+---
+
+### `RPCOperation`
+
+```typescript
+type RPCOperation = "call" | "get" | "set" | "new" | "ref"
+```
+
+Identifies the operation in an `RPCRequest`. `"ref"` is used by the optional `kkrpc/remote-refs`
+feature and will be rejected with an error by the base `RPCChannel`.
+
+---
+
+### `RPCStreamRequest`
+
+```typescript
+interface RPCStreamRequest {
+  t: "sq"
+  id: string
+  sid: string
+  op: RPCStreamOperation
+  n?: number
+  v?: unknown
+}
+```
+
+Control message for pulling or closing a remote async iterator. `op` is `"pull"`, `"return"`, or
+`"throw"`. Used by `StreamingRPCChannel` from `kkrpc/streaming`.
+
+---
+
+### `RPCStreamResponse`
+
+```typescript
+interface RPCStreamResponse {
+  t: "sr"
+  id: string
+  sid: string
+  d?: boolean
+  v?: unknown
+  e?: RPCError
+}
+```
+
+Stream data or acknowledgement record pairing back to an `RPCStreamRequest` by `sid`.
+
+---
+
+### `RPCError`
+
+```typescript
+interface RPCError {
+  n: string        // Error name
+  m: string        // Error message
+  s?: string       // Optional stack trace
+  [key: string]: unknown  // Additional enumerable error fields
+}
+```
+
+Serialized error shape transmitted in failed RPC responses. The channel reconstructs a real `Error`
+on the receiving side, preserving `name`, `message`, `stack`, and any additional enumerable fields.
+
+---
+
+### `RPCMessageMetadata`
+
+```typescript
+interface RPCMessageMetadata {
+  traceparent?: string
+  tracestate?: string
+  baggage?: string
+  requestId?: string
+  sessionId?: string
+  runtime?: Record<string, string | number | boolean | null | undefined>
+  [key: string]: unknown
+}
+```
+
+Optional out-of-band metadata carried with an `RPCRequest`. Populate it via the `getMetadata`
+option on `RPCChannelOptions`. Plugin hooks receive it in their context as `ctx.meta`.
+
+<ParamField path="traceparent" type="string">
+  W3C Trace Context `traceparent` header value for distributed tracing.
+</ParamField>
+
+<ParamField path="tracestate" type="string">
+  W3C Trace Context `tracestate` header value.
+</ParamField>
+
+<ParamField path="baggage" type="string">
+  W3C Baggage header value for cross-cutting concerns.
+</ParamField>
+
+<ParamField path="requestId" type="string">
+  Application or platform request id for log correlation.
+</ParamField>
+
+<ParamField path="sessionId" type="string">
+  Session id for grouping related RPC calls.
+</ParamField>
+
+<ParamField path="runtime" type="Record<string, string | number | boolean | null | undefined>">
+  Runtime-specific low-cardinality metadata, e.g. region or service name.
+</ParamField>
