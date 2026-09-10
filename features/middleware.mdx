@@ -1,5 +1,5 @@
 ---
-title: "Middleware Interceptors for RPC Handlers in kkRPC"
+title: "Middleware Interceptors for RPC Method Handlers in kkRPC"
 sidebarTitle: "Middleware"
 description: "Wrap exposed RPC method handlers in an onion-style interceptor chain for logging, auth, rate limiting, argument mutation, and result transformation."
 ---
@@ -46,7 +46,7 @@ wss.on("connection", (socket) => {
 
 Interceptors execute in the order they are listed — the first entry is the **outermost** layer. Given `[logger, timing, auth]`, the execution order is:
 
-```
+```text
 logger before → timing before → auth before → handler
                                 auth after  → timing after → logger after
 ```

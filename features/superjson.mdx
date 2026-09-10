@@ -1,5 +1,5 @@
 ---
-title: "SuperJSON Codec for Rich Value Types in kkRPC"
+title: "SuperJSON Codec for Rich JavaScript Value Types in kkRPC"
 sidebarTitle: "SuperJSON"
 description: "Preserve Date, Map, Set, BigInt, and other non-JSON values across string-based transports by composing a SuperJSON codec with createTransport."
 ---
@@ -52,7 +52,7 @@ const api = {
   async getStats(): Promise<{ at: Date; counts: Map<string, number> }> {
     return {
       at: new Date(),
-      counts: new Map([["requests", 1024n as unknown as number], ["errors", 3]]),
+      counts: new Map([["requests", 1024], ["errors", 3]]),
     }
   },
 

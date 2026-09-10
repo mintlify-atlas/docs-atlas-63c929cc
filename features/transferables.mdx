@@ -1,5 +1,5 @@
 ---
-title: "Zero-Copy Transferable Objects in kkRPC"
+title: "Zero-Copy Transferable Objects and ArrayBuffers in kkRPC"
 sidebarTitle: "Transferables"
 description: "Send ArrayBuffers and other transferables with zero-copy ownership transfer over Worker and other transfer-capable transports using the transfer() helper."
 ---
@@ -90,7 +90,7 @@ const channel = new RPCChannel(transport, { expose: api, enableTransfer: false }
 await remote.processBuffer(transfer(buffer, [buffer]))
 ```
 
-The `TransferDescriptor` interface describes what `transfer()` produces internally:
+The `TransferDescriptor` type is the record stored internally when you call `transfer()`. The function returns `T` (the original value), while the channel reads the descriptor from an internal `WeakMap` at encode time:
 
 ```typescript
 interface TransferDescriptor {

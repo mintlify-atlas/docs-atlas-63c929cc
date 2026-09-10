@@ -1,10 +1,10 @@
 ---
-title: "Using kkRPC from Python, Go, and Rust"
+title: "Using kkRPC from Python, Go, and Other Languages Guide"
 sidebarTitle: "Cross-Language"
-description: "Connect Python, Go, or Rust clients to a TypeScript kkRPC server over stdio or WebSocket using the compact JSON line-delimited wire protocol."
+description: "Connect Python or Go clients to a TypeScript kkRPC server over stdio or WebSocket using the compact JSON line-delimited wire protocol."
 ---
 
-kkRPC's wire format is plain, line-delimited JSON — no binary framing, no custom serialisation format, and no code generation required. Any language that can read and write newline-terminated JSON strings over a pipe or WebSocket can participate in an RPC session. The `interop/` directory in the kkRPC repository ships ready-to-use client libraries for Python, Go, and Rust that implement exactly this protocol.
+kkRPC's wire format is plain, line-delimited JSON — no binary framing, no custom serialisation format, and no code generation required. Any language that can read and write newline-terminated JSON strings over a pipe or WebSocket can participate in an RPC session. The `interop/` directory in the kkRPC repository ships ready-to-use client libraries for Python and Go that implement exactly this protocol.
 
 ## The JSON Wire Protocol
 
@@ -14,11 +14,16 @@ The object always carries a `t` field that identifies the message type. The rema
 
 ### Message Types
 
-| `t` value | Direction         | Required fields           | Description                                                                          |
-| --------- | ----------------- | ------------------------- | ------------------------------------------------------------------------------------ |
-| `"q"`     | caller → callee   | `id`, `op`, `p`           | RPC request. `op` is `"call"`, `"get"`, `"set"`, or `"new"`. `a` holds the arguments array. |
-| `"r"`     | callee → caller   | `id`, then `v` **or** `e` | RPC response. Success carries `v` (return value). Errors carry `e: { n, m, s? }`.   |
-| `"cb"`    | either direction  | `id`, `a`                 | Callback invocation. Targets a callback previously registered by `id`.               |
+The following message types are used in the compact JSON protocol. Cross-language clients need to handle `q`, `r`, and `cb` for basic RPC. The `cbr`, `sq`, and `sr` types are used by the TypeScript side for callback lifecycle management and async streaming — non-JS clients can ignore them safely.
+
+| `t` value | Direction        | Required fields           | Description                                                                           |
+| --------- | ---------------- | ------------------------- | ------------------------------------------------------------------------------------- |
+| `"q"`     | caller → callee  | `id`, `op`, `p`           | RPC request. `op` is `"call"`, `"get"`, `"set"`, `"new"`, or `"ref"`. `a` holds the arguments array. |
+| `"r"`     | callee → caller  | `id`, then `v` **or** `e` | RPC response. Success carries `v` (return value). Errors carry `e: { n, m, s? }`.    |
+| `"cb"`    | either direction | `id`, `a`                 | Callback invocation. Targets a callback previously registered by `id`.                |
+| `"cbr"`   | either direction | `ids`                     | Callback release. Notifies the owner that the listed callback IDs are no longer held. |
+| `"sq"`    | either direction | `id`, `sid`, `op`         | Async iterator control (pull / return / throw). JS streaming only.                    |
+| `"sr"`    | either direction | `id`, `sid`               | Async iterator data or acknowledgement. JS streaming only.                            |
 
 A minimal request–response pair for `math.add(1, 2)` looks like this:
 
@@ -141,19 +146,29 @@ export PYTHONPATH="$PWD/interop/python:$PYTHONPATH"
 | Method | Operation | Description |
 | ------ | --------- | ----------- |
 | `call(method, *args)` | `"call"` | Call a remote method by dot-separated name |
-| `get(path)` | `"get"` | Read a remote property |
-| `set(path, value)` | `"set"` | Write a remote property |
+| `get(path)` | `"get"` | Read a remote property (pass a list of path segments) |
+| `set(path, value)` | `"set"` | Write a remote property (pass a list of path segments) |
 | `construct(method, *args)` | `"new"` | Invoke a remote constructor |
 
 `call()` blocks the calling thread until the response arrives. A background daemon thread reads incoming messages and dispatches responses and callbacks.
 
 ### Stdio Client
 
+`StdioTransport` takes a `reader` and `writer` file-like object. Spawn the Node server as a child process using `subprocess.Popen` and pass its `stdout` (for reading) and `stdin` (for writing):
+
 ```python interop/python/stdio_client.py
+import subprocess
 from kkrpc import RpcClient, StdioTransport
 
 # Spawn the Node server as a child process
-transport = StdioTransport.from_process(["bun", "interop/node/server.ts"])
+process = subprocess.Popen(
+    ["bun", "interop/node/server.ts"],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    text=True,
+)
+
+transport = StdioTransport(process.stdout, process.stdin)
 client = RpcClient(transport)
 
 # Call a nested method
@@ -171,11 +186,12 @@ def on_callback(payload):
 ret = client.call("withCallback", "hello", on_callback)
 print(ret)  # "callback-sent"
 
-# Read a remote property
+# Read a remote property (pass path as a list)
 theme = client.get(["settings", "theme"])
 print(theme)  # "light"
 
 client.close()
+process.terminate()
 ```
 
 ### WebSocket Client
@@ -197,9 +213,10 @@ client.close()
 
 ### Python Server
 
-The interop library also ships `RpcServer` for exposing a Python API to a TypeScript caller:
+The interop library also ships `RpcServer` for exposing a Python API to a TypeScript caller. Pass `sys.stdin` and `sys.stdout` to `StdioTransport` to bind to the process pipes:
 
 ```python interop/python/server.py
+import sys
 from kkrpc import RpcServer, StdioTransport
 
 api = {
@@ -209,8 +226,8 @@ api = {
     "echo": lambda value: value,
 }
 
-# from_stdio() reads process stdin and writes to process stdout
-server = RpcServer(StdioTransport.from_stdio(), api)
+# Bind to process stdin/stdout
+server = RpcServer(StdioTransport(sys.stdin, sys.stdout), api)
 # The reader thread starts immediately; call server.close() to shut down.
 ```
 
@@ -269,6 +286,8 @@ type Callback func(args ...any)
 
 ### Stdio Client
 
+`NewStdioTransport` takes separate `io.Reader` and `io.Writer` arguments. Use `cmd.StdoutPipe()` and `cmd.StdinPipe()` to get the child process pipes, then start the command before creating the transport:
+
 ```go interop/go/stdio_client.go
 package main
 
@@ -282,10 +301,11 @@ import (
 func main() {
 	// Spawn the Node server as a child process
 	cmd := exec.Command("bun", "interop/node/server.ts")
-	transport, err := kkrpc.NewStdioTransport(cmd)
-	if err != nil {
-		panic(err)
-	}
+	stdin, _ := cmd.StdinPipe()
+	stdout, _ := cmd.StdoutPipe()
+	cmd.Start()
+
+	transport := kkrpc.NewStdioTransport(stdout, stdin)
 	client := kkrpc.NewClient(transport)
 	defer client.Close()
 
@@ -343,12 +363,16 @@ func main() {
 
 ### Go Server
 
-Expose a Go API to a TypeScript kkRPC caller. All registered handlers must use the variadic `func(...any) any` signature:
+Expose a Go API to a TypeScript kkRPC caller. Pass `os.Stdin` and `os.Stdout` to `NewStdioTransport`. All registered handlers must use the variadic `func(...any) any` signature:
 
 ```go interop/go/server.go
 package main
 
-import "kkrpc-interop/kkrpc"
+import (
+	"os"
+
+	"kkrpc-interop/kkrpc"
+)
 
 func main() {
 	api := map[string]any{
@@ -362,7 +386,7 @@ func main() {
 		},
 	}
 
-	server := kkrpc.NewServer(kkrpc.NewStdioTransportFromStdIO(), api)
+	server := kkrpc.NewServer(kkrpc.NewStdioTransport(os.Stdin, os.Stdout), api)
 	defer server.Close()
 	select {} // block forever
 }
@@ -507,7 +531,7 @@ cargo test
 <Accordion title="Transport differences: stdio vs WebSocket">
   Over **stdio**, messages are newline-delimited UTF-8 strings. Each message is one JSON object followed by exactly one `\n` byte. The receiver reads lines and parses each non-empty line as JSON. This makes stdio transports trivially compatible with any language that supports line-buffered I/O.
 
-  Over **WebSocket**, the same JSON object is sent as a single text frame. The newline suffix is optional because WebSocket frames are already delimited. All three language libraries handle both transports through a common `Transport` interface/trait so the RPC client code is identical regardless of which transport is used.
+  Over **WebSocket**, the same JSON object is sent as a single text frame. The newline suffix is optional because WebSocket frames are already delimited. All language libraries handle both transports through a common `Transport` interface/trait so the RPC client code is identical regardless of which transport is used.
 </Accordion>
 
 <Accordion title="SuperJSON and codec selection">
@@ -519,5 +543,5 @@ cargo test
 </Accordion>
 
 <Tip>
-  Start with the compact JSON protocol over **stdio**. It requires no network stack, is easy to debug by inspecting process pipes, and works identically in all three language clients. Switch to WebSocket only when you need to connect processes that are not in a parent–child relationship.
+  Start with the compact JSON protocol over **stdio**. It requires no network stack, is easy to debug by inspecting process pipes, and works identically in all language clients. Switch to WebSocket only when you need to connect processes that are not in a parent–child relationship.
 </Tip>

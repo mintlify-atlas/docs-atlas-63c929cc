@@ -61,7 +61,7 @@ import { createTransport } from "kkrpc/transport"
 const transport = createTransport({
   platform,   // Platform<TWire>  — handles the runtime I/O
   codec,      // Codec<RPCMessage, TWire> — handles serialization
-  capabilities?: TransportCapabilities  // optional overrides
+  // capabilities?: TransportCapabilities — optional overrides
 })
 ```
 
@@ -309,9 +309,9 @@ The `wrapHandler` hooks form an onion chain: each plugin calls `next()` to deleg
 
 ```typescript
 import { expose } from "kkrpc"
-import { middlewarePlugin, type RPCInterceptor } from "kkrpc/middleware"
+import { middlewarePlugin, type MiddlewareHandler } from "kkrpc/middleware"
 
-const logger: RPCInterceptor = async (ctx, next) => {
+const logger: MiddlewareHandler = async (ctx, next) => {
   console.log("rpc:start", ctx.method, ctx.args)
   const result = await next()
   console.log("rpc:end", ctx.method)

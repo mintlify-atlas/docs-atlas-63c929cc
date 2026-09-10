@@ -453,6 +453,7 @@ import {
   type ElectronTransportOptions,
   type ElectronMessageEndpoint,
   type ElectronUtilityProcessEndpoint,
+  type ElectronUtilityProcessChildEndpoint,
   type SecureIpcBridgeOptions,
   type SecureIpcBridge,
 } from "kkrpc/electron"
@@ -493,6 +494,12 @@ interface ElectronUtilityProcessEndpoint {
   on(event: "message", listener: (message: RPCMessage) => void): void
   off(event: "message", listener: (message: RPCMessage) => void): void
   kill?(): unknown
+}
+
+interface ElectronUtilityProcessChildEndpoint {
+  postMessage(message: RPCMessage): void
+  on(event: "message", listener: (event: { data: RPCMessage }) => void): void
+  off(event: "message", listener: (event: { data: RPCMessage }) => void): void
 }
 
 interface SecureIpcBridgeOptions {

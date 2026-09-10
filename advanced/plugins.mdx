@@ -1,7 +1,7 @@
 ---
 title: "Plugin System: Hooks, Context, and Ordering in kkRPC"
 sidebarTitle: "Plugins"
-description: "Extend kkRPC server-side request handling with onRequest, wrapHandler, onResponse, and onError hooks. Compose multiple plugins including the built-in validation and middleware plugins."
+description: "Extend kkRPC request handling with onRequest, wrapHandler, onResponse, and onError hooks. Share per-request state across plugins via the typed context bag."
 ---
 
 The plugin system is how kkRPC lets you intercept and extend local request handling without touching your API implementation. Plugins are plain objects that implement any subset of four hooks, each receiving a strongly-typed context object that carries the request state. Because all four hooks share a mutable `state` bag, separate plugins can coordinate within the same request lifecycle without coupling their implementations.
@@ -74,7 +74,7 @@ Each hook receives a context object typed to the available data at that point in
     ```typescript
     interface RPCRequestContext {
       id: string                   // request identifier
-      operation: RPCOperation      // "call" | "get" | "set" | "new"
+      operation: RPCOperation      // "call" | "get" | "set" | "new" | "ref"
       path: string[]               // property path segments
       method: string               // dot-joined path, e.g. "math.add"
       args: unknown[]              // decoded call arguments

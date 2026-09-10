@@ -1,7 +1,7 @@
 ---
-title: "iframe Transport for Sandboxed Cross-Frame RPC"
+title: "iframe Transport for Cross-Frame RPC via MessageChannel"
 sidebarTitle: "iframe"
-description: "Establish type-safe bidirectional RPC between a parent page and an embedded iframe using a MessageChannel handshake with automatic fallback to window.postMessage."
+description: "Establish bidirectional typed RPC between a parent page and an embedded iframe via a MessageChannel handshake, with automatic postMessage fallback."
 ---
 
 The iframe transport lets a parent page and a child page embedded in an `<iframe>` call each other through type-safe proxy objects. When `MessageChannel` is available (all modern browsers), kkrpc performs a small handshake that upgrades the connection to a dedicated `MessagePort` pair — enabling bidirectional calls, callback arguments, and transferable objects. In environments where `MessageChannel` is absent, the transport falls back to `window.postMessage` without transferable support.

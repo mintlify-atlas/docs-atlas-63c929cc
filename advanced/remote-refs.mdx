@@ -1,7 +1,7 @@
 ---
 title: "Remote References: Comlink-Style Proxy Objects in kkRPC"
 sidebarTitle: "Remote Refs"
-description: "Pass functions and objects by reference across the RPC boundary using proxy(). The kkrpc/remote-refs entry enables Comlink-style explicit remote references with full lifecycle control."
+description: "Pass functions and objects by reference with proxy(). Use kkrpc/remote-refs for Comlink-style remote references, typed object handles, and releaseProxy()."
 ---
 
 Remote references are an opt-in extension to kkRPC that lets you pass live JavaScript objects and functions across the RPC boundary by reference rather than by value. Instead of serializing a function's source or cloning an object, you mark it with `proxy()` and the channel retains ownership on the sender's side, sending only a compact handle to the receiver. The receiver gets a transparent proxy that forwards every call, property read, or property write back across the wire to the original owner.

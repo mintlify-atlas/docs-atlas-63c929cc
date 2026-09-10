@@ -1,5 +1,5 @@
 ---
-title: "Runtime Validation with Standard Schema in kkRPC"
+title: "Input and Output Validation with Standard Schema in kkRPC"
 sidebarTitle: "Validation"
 description: "Add input and output validation to exposed RPC methods using Zod, Valibot, or any Standard Schema-compatible library — no code generation required."
 ---
@@ -202,4 +202,18 @@ const validators: ValidatorMap<API> = {
 
 <Accordion title="isRPCValidationError(error)">
   Type predicate that returns `true` when `error` is an `RPCValidationError` (checks `error.name === "RPCValidationError"`). Use this to narrow caught errors on the caller side.
+</Accordion>
+
+<Accordion title="InferAPI<T>">
+  Utility type that derives the remote-callable API surface from a schema-first API definition. `DefinedMethod` entries become typed async functions with argument types inferred from the input schema's output type, and return types from the output schema. Nested objects are inferred recursively.
+
+  ```typescript
+  import { type InferAPI } from "kkrpc/validation"
+  export type API = InferAPI<typeof api>
+  // Pass to wrap<API>(transport) on the client side
+  ```
+</Accordion>
+
+<Accordion title="ValidatorMap<API>">
+  Type-first validator map keyed by the exposed API structure. Method leaves hold `{ input?, output? }` with Standard Schema validators for the non-callback arguments and awaited return value respectively. Nested objects hold nested `ValidatorMap` values. Used with `validationPlugin<MathAPI>(validators)` in the type-first pattern.
 </Accordion>

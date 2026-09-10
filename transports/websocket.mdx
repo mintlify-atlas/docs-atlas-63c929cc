@@ -6,7 +6,7 @@ description: "Establish persistent full-duplex RPC channels over WebSocket using
 
 WebSocket transport provides a persistent, full-duplex channel that outlives individual requests. Because the connection stays open, both the client and the server can initiate calls, pass callback arguments, and stream async iterables — none of which are possible over plain HTTP. Messages travel as JSON strings, so transferable objects are not supported by this transport.
 
-There are four factory functions spread across two subpath entries. Use `webSocketTransport` or `webSocketClientTransport` from `kkrpc/ws` for raw WebSocket objects. Use `honoWebSocketTransport` from `kkrpc/ws/hono` or `elysiaWebSocketTransport` from `kkrpc/ws/elysia` when your server uses those frameworks, which route lifecycle events through callbacks rather than exposing a standard socket object.
+There are six factory functions spread across three subpath entries. Use `webSocketTransport` or `webSocketClientTransport` from `kkrpc/ws` for raw WebSocket objects. Import from `kkrpc/ws/hono` when your server uses Hono, or from `kkrpc/ws/elysia` when it uses Elysia — both frameworks route lifecycle events through callbacks rather than exposing a standard socket object, so each entry ships a feedable low-level transport plus a higher-level handler helper.
 
 ## Transport capabilities
 
@@ -53,7 +53,11 @@ There are four factory functions spread across two subpath entries. Use `webSock
   ```typescript
   import { elysiaWebSocketTransport, createElysiaWebSocketHandler } from "kkrpc/ws/elysia"
   elysiaWebSocketTransport(ws: ElysiaSocketLike): FeedableElysiaWebSocketTransport
-  createElysiaWebSocketHandler<LocalAPI>(options: { expose: LocalAPI; timeout?: number }): ElysiaLifecycleHandlers
+  createElysiaWebSocketHandler<LocalAPI>(options: { expose: LocalAPI; timeout?: number }): {
+    open(ws: ElysiaSocketLike): void
+    message(ws: ElysiaSocketLike, message: unknown): void
+    close(ws: ElysiaSocketLike): void
+  }
   ```
 </ParamField>
 

@@ -1,7 +1,7 @@
 ---
 title: "Building a Custom Transport with createTransport in kkRPC"
 sidebarTitle: "Custom Transport"
-description: "Compose a Platform and Codec into a Transport using createTransport(). Implement custom platforms for any runtime primitive and custom codecs for any wire serialization format."
+description: "Compose a Platform and Codec with createTransport() from kkrpc/transport. Implement custom platforms and codecs for any runtime or serialization format."
 ---
 
 Every built-in kkRPC transport is built from two pieces: a `Platform` that moves raw wire values over some runtime primitive (a socket, a pipe, a message channel), and a `Codec` that translates between kkRPC's internal `RPCMessage` objects and those wire values. The `createTransport()` function from `kkrpc/transport` composes them into a `Transport<RPCMessage>` that `RPCChannel` can use.

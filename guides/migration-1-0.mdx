@@ -1,10 +1,10 @@
 ---
-title: "Migrating to kkRPC 1.0 Native Transports"
-sidebarTitle: "Migration 1.0"
-description: "Step-by-step guide for moving from the classic IoInterface adapter model to the native Transport<RPCMessage> architecture introduced in kkRPC 1.0."
+title: "Migrating to the kkRPC Native Transport Architecture"
+sidebarTitle: "Migration Guide"
+description: "Move from the IoInterface adapter model to the native Transport<RPCMessage> architecture and per-runtime subpath exports introduced in kkRPC 2.0."
 ---
 
-kkRPC 1.0 replaced the original `IoInterface`/`IoMessage` adapter model with a leaner, native `Transport<RPCMessage>` architecture. The public API surface shrank considerably — a handful of legacy entries were removed, and every runtime transport moved to its own subpath export. If you are upgrading from a 0.x or pre-release 1.0 codebase, this guide covers every breaking change and shows the exact import changes you need to make.
+kkRPC 2.0 replaced the original `IoInterface`/`IoMessage` adapter model with a leaner, native `Transport<RPCMessage>` architecture. The public API surface shrank considerably — a handful of legacy entries were removed, and every runtime transport moved to its own subpath export. If you are upgrading from a 0.x or pre-2.0 codebase, this guide covers every breaking change and shows the exact import changes you need to make.
 
 <Warning>
   This migration contains **breaking changes**. The removed exports (`IoInterface`, `IoMessage`, `RPCValidators`, `RPCInterceptor`, `classic-compat`, `next/io`, `browser-lite`, `browser-mini`, `electron-ipc`) no longer exist in the package. TypeScript will give you a compile error if you reference them — use that as a checklist to track your migration progress.
@@ -17,7 +17,7 @@ kkRPC 1.0 replaced the original `IoInterface`/`IoMessage` adapter model with a l
 The classic adapter model required implementing an `IoInterface` with `read()` and `write()` methods and wrapping it before passing it to `RPCChannel`. This indirection is gone. Transports are now message-level objects that expose `send()` and `subscribe()` directly.
 
 ```typescript
-// Before (0.x) — IoInterface adapter
+// Before — IoInterface adapter
 class MyTransport implements IoInterface {
   async read(): Promise<string> { /* ... */ }
   async write(data: string): Promise<void> { /* ... */ }
@@ -27,7 +27,7 @@ const channel = new RPCChannel(new MyTransport(), { expose: api })
 ```
 
 ```typescript
-// After (1.0) — native Transport<RPCMessage>
+// After — native Transport<RPCMessage>
 import { createTransport } from "kkrpc/transport"
 
 const transport = createTransport({ platform: myPlatform, codec: myCodec })
@@ -36,7 +36,7 @@ const channel = new RPCChannel(transport, { expose: api })
 
 ### Removed: `RPCValidators` and `RPCInterceptor`
 
-Validation and middleware were previously configured as top-level channel options (`validators`, `interceptors`). They are now plugins supplied through the `plugins` array. The types `RPCValidators` and `RPCInterceptor` no longer exist.
+Validation and middleware were previously configured as top-level channel options (`validators`, `interceptors`). They are now plugins supplied through the `plugins` array. The types `RPCValidators` and `RPCInterceptor` no longer exist in the main entry — `RPCInterceptor` moved to `kkrpc/middleware`.
 
 ### Removed Entry Points
 
@@ -68,8 +68,8 @@ All first-party transports (`workerTransport`, `webSocketTransport`, `nodeStdioT
 
 Use this table to find the new import for every old one. Every transport factory now lives behind a subpath export so the main `kkrpc` entry stays browser-safe and tree-shakeable.
 
-| Old import (0.x / pre-1.0) | New import (1.0+) |
-| --------------------------- | ----------------- |
+| Old import (pre-2.0) | New import (2.0+) |
+| -------------------- | ----------------- |
 | `import { RPCChannel, wrap, expose } from "kkrpc"` | `import { RPCChannel, wrap, expose } from "kkrpc"` ✅ unchanged |
 | `import { IoInterface, IoMessage } from "kkrpc"` | **Removed** — use factory functions instead |
 | `import { RPCValidators } from "kkrpc"` | `import { validationPlugin } from "kkrpc/validation"` |
@@ -91,7 +91,7 @@ Use this table to find the new import for every old one. Every transport factory
 
 <CodeGroup>
 
-```typescript Before (0.x)
+```typescript Before — main.ts
 // main.ts — old IoInterface worker wrapper
 import { RPCChannel } from "kkrpc"
 import type { WorkerAPI } from "./worker"
@@ -109,7 +109,7 @@ const api = channel.getAPI()
 await api.ping()
 ```
 
-```typescript After (1.0)
+```typescript After — main.ts
 // main.ts — native workerTransport
 import { wrap } from "kkrpc"
 import { workerTransport } from "kkrpc/worker"
@@ -125,7 +125,7 @@ await api.ping()
 
 <CodeGroup>
 
-```typescript Before (0.x) — worker.ts
+```typescript Before — worker.ts
 import { RPCChannel } from "kkrpc"
 
 const api = { async ping() { return "pong" } }
@@ -140,7 +140,7 @@ const transport = {
 const channel = new RPCChannel<WorkerAPI, {}>(transport, { expose: api })
 ```
 
-```typescript After (1.0) — worker.ts
+```typescript After — worker.ts
 import { expose } from "kkrpc"
 import { workerSelfTransport } from "kkrpc/worker"
 
@@ -156,7 +156,7 @@ expose(api, workerSelfTransport())
 
 <CodeGroup>
 
-```typescript Before (0.x) — child.ts
+```typescript Before — child.ts
 import { RPCChannel, IoInterface } from "kkrpc"
 
 class StdioTransport implements IoInterface {
@@ -184,7 +184,7 @@ class StdioTransport implements IoInterface {
 const channel = new RPCChannel<typeof api, {}>(new StdioTransport(), { expose: api })
 ```
 
-```typescript After (1.0) — child.ts
+```typescript After — child.ts
 import { expose } from "kkrpc"
 import { nodeStdioTransport } from "kkrpc/stdio"
 
@@ -202,7 +202,7 @@ expose(api, nodeStdioTransport())
 
 <CodeGroup>
 
-```typescript Before (0.x) — parent.ts
+```typescript Before — parent.ts
 import { spawn } from "node:child_process"
 import { RPCChannel } from "kkrpc"
 import type { ChildAPI } from "./child"
@@ -215,7 +215,7 @@ const channel = new RPCChannel<{}, ChildAPI>(transport)
 const api = channel.getAPI()
 ```
 
-```typescript After (1.0) — parent.ts
+```typescript After — parent.ts
 import { spawn } from "node:child_process"
 import { wrap } from "kkrpc"
 import { nodeStdioTransport } from "kkrpc/stdio"
@@ -237,7 +237,7 @@ console.log(await api.version())
 
 <CodeGroup>
 
-```typescript Before (0.x) — server.ts
+```typescript Before — server.ts
 import { RPCChannel } from "kkrpc"
 import { WebSocketServer } from "ws"
 
@@ -253,7 +253,7 @@ wss.on("connection", (socket) => {
 })
 ```
 
-```typescript After (1.0) — server.ts
+```typescript After — server.ts
 import { expose } from "kkrpc"
 import { webSocketTransport } from "kkrpc/ws"
 import { WebSocketServer } from "ws"
@@ -269,7 +269,7 @@ wss.on("connection", (socket) => {
 
 <CodeGroup>
 
-```typescript Before (0.x) — client.ts
+```typescript Before — client.ts
 import { RPCChannel } from "kkrpc"
 import type { API } from "./server"
 
@@ -285,7 +285,7 @@ const channel = new RPCChannel<{}, API>(transport)
 const api = channel.getAPI()
 ```
 
-```typescript After (1.0) — client.ts
+```typescript After — client.ts
 import { wrap } from "kkrpc"
 import { webSocketClientTransport } from "kkrpc/ws"
 import type { API } from "./server"
@@ -301,7 +301,7 @@ console.log(await api.greet("World"))
 
 <CodeGroup>
 
-```typescript Before (0.x)
+```typescript Before
 import { expose, RPCChannel } from "kkrpc"
 import { z } from "zod"
 
@@ -317,7 +317,7 @@ const channel = new RPCChannel(transport, {
 })
 ```
 
-```typescript After (1.0)
+```typescript After
 import { expose } from "kkrpc"
 import { defineAPI, defineMethod, extractValidators, validationPlugin } from "kkrpc/validation"
 import { z } from "zod"
@@ -366,7 +366,7 @@ expose(api, transport, {
 
 <CodeGroup>
 
-```typescript Before (0.x)
+```typescript Before
 import { RPCChannel, RPCInterceptor } from "kkrpc"
 
 // Old: RPCInterceptor type + interceptors channel option
@@ -383,7 +383,7 @@ const channel = new RPCChannel(transport, {
 })
 ```
 
-```typescript After (1.0)
+```typescript After
 import { expose } from "kkrpc"
 import { middlewarePlugin, type RPCInterceptor } from "kkrpc/middleware"
 
@@ -404,26 +404,30 @@ expose(api, transport, {
 
 ### Electron IPC
 
+The entry point changed from `kkrpc/electron-ipc` to `kkrpc/electron`. The `electronIpcTransport` function now requires an options object with an `endpoint` property — pass `ipcMain`, `ipcRenderer`, or a secure preload bridge:
+
 <CodeGroup>
 
-```typescript Before (0.x)
+```typescript Before
 import { expose } from "kkrpc"
 import { electronIpcTransport } from "kkrpc/electron-ipc"
 
-expose(api, electronIpcTransport())
+// Old entry point
+expose(api, electronIpcTransport({ endpoint: ipcMain }))
 ```
 
-```typescript After (1.0)
+```typescript After
 import { expose } from "kkrpc"
 import { electronIpcTransport } from "kkrpc/electron"
 
-expose(api, electronIpcTransport())
+// New entry point — same options shape
+expose(api, electronIpcTransport({ endpoint: ipcMain }))
 ```
 
 </CodeGroup>
 
 <Note>
-  The entry point changed from `kkrpc/electron-ipc` to `kkrpc/electron`. The `electronUtilityProcessTransport()` factory for Electron utility processes is also exported from the same new entry.
+  The `electronUtilityProcessTransport(endpoint)` and `electronUtilityProcessChildTransport()` factories for Electron utility processes are also exported from `kkrpc/electron`.
 </Note>
 
 ## `RPCChannel` vs `wrap` / `expose`

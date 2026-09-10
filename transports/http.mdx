@@ -1,7 +1,7 @@
 ---
-title: "HTTP Transport for Unary RPC over Standard Fetch"
+title: "HTTP Transport for Unary Request-Response RPC Calls"
 sidebarTitle: "HTTP"
-description: "Expose any JavaScript object as a fetch-compatible HTTP RPC endpoint with createHttpHandler and call it type-safely with httpClientTransport from kkrpc/http."
+description: "Expose a local API as a fetch-compatible HTTP endpoint with createHttpHandler, and consume it from any client using httpClientTransport in kkrpc/http."
 ---
 
 The HTTP transport maps each RPC call to a single POST request and a single JSON response. It requires no persistent connection, making it easy to drop into any existing web server — Express, Hono, Fastify, Bun, Deno, Cloudflare Workers, or any runtime that speaks the Fetch API. The handler returns a standard `Response`, so it composes with whatever routing layer you already have.

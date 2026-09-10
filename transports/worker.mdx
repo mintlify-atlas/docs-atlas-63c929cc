@@ -1,7 +1,7 @@
 ---
-title: "Web Worker Transport for Type-Safe RPC Calls"
+title: "Web Worker Transport for Type-Safe Cross-Thread RPC"
 sidebarTitle: "Web Worker"
-description: "Run typed RPC across Web Worker boundaries using workerTransport and workerSelfTransport, with full support for transferable objects and callback arguments."
+description: "Run typed RPC across Web Worker boundaries using workerTransport and workerSelfTransport, with transferable objects and callback argument support."
 ---
 
 The Web Worker transport is the simplest way to move work off the main thread while keeping a fully typed API surface. It wraps the native `postMessage()` / `addEventListener("message")` pair on both sides of a worker boundary, giving you bidirectional calls, callback arguments, and zero-copy transferable ownership moves through the same `transfer()` helper used everywhere else in kkrpc.
@@ -166,10 +166,10 @@ await api.processBuffer(transfer(buffer, [buffer]))
 
 ## Closing the transport
 
-Calling the `ExposedController.dispose()` or `channel.destroy()` on the main-thread side will invoke `worker.terminate()`, which immediately stops the worker. Call `dispose` or `destroy` from the main thread once you are done with the worker to avoid memory leaks.
+Calling `controller.dispose()` on the main-thread side or `channel.destroy()` will invoke `worker.terminate()`, which immediately stops the worker. Call `dispose` or `destroy` from the main thread once you are done with the worker to avoid memory leaks.
 
 ```typescript main.ts
-import { expose } from "kkrpc"
+import { wrap, dispose } from "kkrpc"
 import { workerTransport } from "kkrpc/worker"
 import type { WorkerAPI } from "./worker"
 
@@ -177,10 +177,13 @@ const worker = new Worker(new URL("./worker.ts", import.meta.url), {
   type: "module"
 })
 
-const controller = expose({} as WorkerAPI, workerTransport(worker))
+const api = wrap<WorkerAPI>(workerTransport(worker))
+
+// Call the worker
+console.log(await api.add(2, 3)) // 5
 
 // Terminate the worker when done
-controller.dispose()
+dispose(api)
 ```
 
 <Note>

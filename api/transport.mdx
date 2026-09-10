@@ -348,3 +348,81 @@ export function myCustomTransport(): Transport<RPCMessage> {
   runtime once and fan out to kkrpc listeners via a local `Set`, as shown above. This avoids
   duplicate listeners when multiple channels share one transport.
 </Tip>
+
+---
+
+## Built-in Codecs (`kkrpc/codecs`)
+
+kkrpc ships three ready-made codec factories in the `kkrpc/codecs` subpath entry. Pass one to
+`createTransport` when composing a custom transport from a platform primitive.
+
+```typescript
+import { objectCodec, jsonCodec, jsonLineCodec } from "kkrpc/codecs"
+```
+
+### `objectCodec`
+
+```typescript
+function objectCodec<TMessage>(): Codec<TMessage, TMessage>
+```
+
+Identity codec for platforms that already carry JavaScript objects (e.g. `Worker`, `MessageChannel`,
+`BroadcastChannel`). Passes messages through without serialization, so non-JSON values such as
+`Date`, `Map`, and `ArrayBuffer` survive. Advertises `capabilities.transfer = true` because it
+does not clone or serialize values, making transferables safe to forward.
+
+```typescript object-codec.ts
+import { objectCodec } from "kkrpc/codecs"
+import { createTransport } from "kkrpc/transport"
+
+const transport = createTransport({
+  platform: myObjectPlatform,
+  codec: objectCodec()
+})
+```
+
+---
+
+### `jsonCodec`
+
+```typescript
+function jsonCodec<TMessage>(): Codec<TMessage, string>
+```
+
+Plain JSON codec for string-based platforms. Encodes each message with `JSON.stringify` and decodes
+with `JSON.parse`. Advertises `capabilities.transfer = false` because transferables cannot survive
+JSON serialization. Use for platforms that exchange plain strings (e.g. HTTP, socket.io).
+
+```typescript json-codec.ts
+import { jsonCodec } from "kkrpc/codecs"
+import { createTransport } from "kkrpc/transport"
+
+const transport = createTransport({
+  platform: myStringPlatform,
+  codec: jsonCodec()
+})
+```
+
+---
+
+### `jsonLineCodec`
+
+```typescript
+function jsonLineCodec<TMessage>(): Codec<TMessage, string>
+```
+
+JSON codec with newline framing for stream-based transports such as stdio. Encodes as
+`JSON.stringify(message) + "\n"` and strips trailing whitespace before decoding. Advertises
+`capabilities.transfer = false`. Used internally by `nodeStdioTransport`, `bunStdioTransport`, and
+`denoStdioTransport`.
+
+```typescript json-line-codec.ts
+import { jsonLineCodec } from "kkrpc/codecs"
+import { createTransport } from "kkrpc/transport"
+import { stdioPlatform } from "kkrpc/stdio"
+
+const transport = createTransport({
+  platform: stdioPlatform({ readable: process.stdin, writable: process.stdout }),
+  codec: jsonLineCodec()
+})
+```

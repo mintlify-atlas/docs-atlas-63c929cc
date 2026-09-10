@@ -1,5 +1,5 @@
 ---
-title: "RPCChannel: Bidirectional RPC Channel Class"
+title: "RPCChannel Class: Bidirectional RPC Channel Reference"
 sidebarTitle: "RPCChannel"
 description: "Full reference for RPCChannel: constructor, RPCChannelOptions fields, getAPI, destroy lifecycle, plugin hook types, and when to prefer it over wrap/expose."
 ---
@@ -205,7 +205,7 @@ try {
 
 ---
 
-## Using `CALL_OPTIONS` and `withCallOptions`
+## `withCallOptions`
 
 `withCallOptions(proxy, options)` derives a new proxy from an existing remote proxy so individual
 calls can override `timeout` or attach an `AbortSignal` without changing the channel default. It

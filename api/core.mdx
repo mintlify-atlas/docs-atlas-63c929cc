@@ -1,5 +1,5 @@
 ---
-title: "kkRPC Core API: wrap, expose, dispose, transfer"
+title: "kkRPC Core API: wrap, expose, dispose, and transfer"
 sidebarTitle: "Core Exports"
 description: "Reference for the kkrpc entry: wrap, expose, dispose, transfer, withCallOptions, releaseCallback, error classes, and all RPCMessage protocol types."
 ---
@@ -48,7 +48,7 @@ const msg = await api.echo("hello RPC")  // → "hello RPC"
 
 <ParamField path="options" type="Omit<RPCChannelOptions, 'expose'>">
   Optional channel configuration. All fields from `RPCChannelOptions` are accepted except `expose`,
-  which is reserved for `expose()`. See [`RPCChannelOptions`](/api/rpc-channel#rpcchaneloptions) for
+  which is reserved for `expose()`. See [`RPCChannelOptions`](/api/rpc-channel#rpcchannelopt) for
   the full field list.
 </ParamField>
 
@@ -413,6 +413,17 @@ feature and will be rejected with an error by the base `RPCChannel`.
 
 ---
 
+### `RPCStreamOperation`
+
+```typescript
+type RPCStreamOperation = "pull" | "return" | "throw"
+```
+
+Identifies the control operation in an `RPCStreamRequest`. Used internally by `StreamingRPCChannel`
+from `kkrpc/streaming` to implement back-pressure and early termination on remote async iterators.
+
+---
+
 ### `RPCStreamRequest`
 
 ```typescript
@@ -427,7 +438,8 @@ interface RPCStreamRequest {
 ```
 
 Control message for pulling or closing a remote async iterator. `op` is `"pull"`, `"return"`, or
-`"throw"`. Used by `StreamingRPCChannel` from `kkrpc/streaming`.
+`"throw"`. `n` carries the pull count for back-pressure; `v` carries a value passed to `return()`
+or `throw()`. Used by `StreamingRPCChannel` from `kkrpc/streaming`.
 
 ---
 

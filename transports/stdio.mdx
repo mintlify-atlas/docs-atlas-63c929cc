@@ -1,5 +1,5 @@
 ---
-title: "Stdio Transport for Cross-Process RPC over Pipes"
+title: "Stdio Transport for Cross-Process RPC over JSON Lines"
 sidebarTitle: "Stdio"
 description: "Wire Node.js, Bun, or Deno processes together over newline-delimited JSON stdio using nodeStdioTransport, stdioJsonTransport, and related helpers."
 ---
@@ -227,12 +227,12 @@ All three runtimes use the same `nodeStdioTransport` function from `kkrpc/stdio`
 
 ## Observing non-RPC output
 
-Some child processes write plain text (logs, progress output) alongside RPC frames. Use `onInvalidFrame` to capture those lines separately without losing them.
+Some child processes write plain text (logs, progress output) alongside RPC frames. Use `stdioJsonTransport` with `onInvalidFrame` to capture those lines separately without losing them. Note that `nodeStdioTransport` accepts only `readable`, `writable`, and `lifecycle` options; `onInvalidFrame` is available only on the lower-level `stdioJsonTransport`.
 
 ```typescript parent.ts
-import { nodeStdioTransport } from "kkrpc/stdio"
+import { stdioJsonTransport } from "kkrpc/stdio"
 
-const transport = nodeStdioTransport({
+const transport = stdioJsonTransport({
   readable: child.stdout,
   writable: child.stdin,
   onInvalidFrame(frame, error) {

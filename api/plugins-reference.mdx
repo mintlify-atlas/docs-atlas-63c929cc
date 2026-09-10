@@ -257,11 +257,20 @@ Thrown by the validation plugin when input or output validation fails. Extends t
 
 ```typescript rpc-validation-error.ts
 class RPCValidationError extends Error {
-  readonly name = "RPCValidationError"
   readonly phase: "input" | "output"
   readonly method: string
   readonly issues: ReadonlyArray<StandardSchemaV1.Issue>
+
+  constructor(
+    phase: "input" | "output",
+    method: string,
+    issues: ReadonlyArray<StandardSchemaV1.Issue>
+  ) {
+    // Sets this.name = "RPCValidationError" and this.message inside constructor
+  }
 }
+
+function isRPCValidationError(error: unknown): error is RPCValidationError
 ```
 
 <ResponseField name="phase" type='"input" | "output"'>
@@ -275,6 +284,8 @@ class RPCValidationError extends Error {
 <ResponseField name="issues" type="ReadonlyArray<StandardSchemaV1.Issue>">
   Validation issues reported by the schema library. Each issue has a `message` string and an optional `path`.
 </ResponseField>
+
+`isRPCValidationError(error)` is a type-guard helper that returns `true` when `error` is an `RPCValidationError` instance, narrowing the type for safe field access.
 
 ---
 
@@ -310,9 +321,16 @@ const remote = wrap<InferAPI<typeof api>>(clientTransport)
 ```
 
 ```typescript schema-first-signatures.ts
-function defineMethod<InputSchema, OutputSchema>(
-  schemas: { input: InputSchema; output: OutputSchema },
-  handler: (...args: InferOutput<InputSchema>) => Promise<InferOutput<OutputSchema>>
+function defineMethod<
+  InputSchema extends StandardSchemaV1,
+  OutputSchema extends StandardSchemaV1
+>(
+  schemas: MethodSchemaConfig<InputSchema, OutputSchema>,
+  handler: (
+    ...args: StandardSchemaV1.InferOutput<InputSchema> extends readonly unknown[]
+      ? StandardSchemaV1.InferOutput<InputSchema>
+      : [StandardSchemaV1.InferOutput<InputSchema>]
+  ) => Promise<StandardSchemaV1.InferOutput<OutputSchema>>
 ): DefinedMethod<InputSchema, OutputSchema>
 
 function defineAPI<T extends Record<string, unknown>>(api: T): T

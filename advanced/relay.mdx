@@ -65,11 +65,12 @@ Messages flow symmetrically. When a message arrives on `left`, it is sent to `ri
 
 ```typescript relay-process.ts
 // Electron main process bridging renderer ↔ worker
-import { ipcMainTransport } from "kkrpc/electron"
+import { electronIpcTransport } from "kkrpc/electron"
 import { workerTransport } from "kkrpc/worker"
 import { relayTransport } from "kkrpc/relay"
 
-const rendererTransport = ipcMainTransport()
+// endpoint is an ipcMain handle or a preload bridge implementing ElectronMessageEndpoint
+const rendererTransport = electronIpcTransport({ endpoint: ipcMainEndpoint })
 const worker = new Worker(new URL("./worker.js", import.meta.url))
 const wTransport = workerTransport(worker)
 
@@ -199,12 +200,17 @@ console.log(await remote.compute(12)) // 144
 When the destination transport advertises `capabilities.transfer === true`, the relay automatically collects transferable objects found in the message payload (such as `ArrayBuffer`, `MessagePort`, `ReadableStream`) and forwards them in the `send()` call. This preserves zero-copy semantics across the relay boundary.
 
 ```typescript
-// Right transport supports transferables
-const right = new MemoryTransport({ transfer: true })
+import { relayTransport } from "kkrpc/relay"
+import { workerTransport, workerSelfTransport } from "kkrpc/worker"
+
+// Worker transport has capabilities.transfer = true
+const left = workerTransport(leftWorker)
+const right = workerTransport(rightWorker)
+
 const relay = relayTransport(left, right)
 
-// ArrayBuffer in the message payload is forwarded as a transferable
-const buffer = new ArrayBuffer(8)
-left.emit({ t: "q", id: "1", op: "call", p: ["take"], a: [buffer] })
-// right.send is called with buffer in the transfers array
+// When the relay forwards a message that contains an ArrayBuffer,
+// MessagePort, ReadableStream, or other Transferable from left to right,
+// those values are extracted and passed to right.send() as the transfers
+// array — preserving zero-copy semantics across the relay boundary.
 ```
